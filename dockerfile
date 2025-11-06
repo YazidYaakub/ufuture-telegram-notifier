@@ -31,7 +31,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 # Copy application file
-COPY ufuture_scraper_with_telegram_docker.py .
+COPY ufuture-scraper.py .
 
 # Create volume directories
 RUN mkdir -p /app/data /app/logs
