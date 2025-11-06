@@ -5,4 +5,4 @@
 # Hours: 6-23 (6 AM to 11 PM)
 # Minutes: 0,10,20,30,40,50 (every 10 minutes)
 
-0,10,20,30,40,50 6-23 * * * cd /app && python ufuture_scraper_with_telegram_docker.py >> /app/logs/cron.log 2>&1
+0,10,20,30,40,50 6-23 * * * cd /app && python ufuture_scraper.py >> /app/logs/cron.log 2>&1
