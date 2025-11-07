@@ -8,19 +8,18 @@ RUN apt-get update && apt-get install -y \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Install UV
-RUN pip install uv --break-system-packages
+# Install UV globally
+RUN pip install uv
 
 # Copy project files
 COPY pyproject.toml .
 COPY uv.lock .
 
-# Install dependencies with UV
-RUN uv venv /opt/venv
-RUN /opt/venv/bin/uv sync --frozen
+# Install dependencies directly (no venv)
+RUN uv pip install -r /dev/stdin < <(uv pip compile pyproject.toml)
 
-# Set PATH to use venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Or simpler - just install from pyproject.toml
+RUN pip install requests beautifulsoup4 lxml
 
 # Copy application file
 COPY ufuture-scraper.py .
