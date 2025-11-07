@@ -5,7 +5,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
-    cron \
+    dcron \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the packages your script needs
@@ -17,20 +17,19 @@ COPY ufuture-scraper.py .
 # Create volume directories
 RUN mkdir -p /app/data /app/logs
 
-# Copy crontab
-COPY crontab /etc/cron.d/ufuture-crontab
-RUN chmod 0644 /etc/cron.d/ufuture-crontab && \
-    crontab /etc/cron.d/ufuture-crontab && \
-    touch /app/logs/cron.log && \
-    chmod 666 /app/logs/cron.log
+# Create cron spool directory
+RUN mkdir -p /var/spool/cron/crontabs
 
-# Copy entrypoint script
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+# Copy crontab to the proper location
+COPY crontab /var/spool/cron/crontabs/root
+RUN chmod 0600 /var/spool/cron/crontabs/root
+
+# Create log file with proper permissions
+RUN touch /app/logs/cron.log && chmod 666 /app/logs/cron.log
 
 # Health check
 HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import sqlite3; sqlite3.connect('/app/data/ufuture_forums.db').execute('SELECT 1')" || exit 1
 
-# Run entrypoint script
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Run crond in foreground
+CMD ["crond", "-f", "-l", "2"]
