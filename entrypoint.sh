@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Start cron daemon
-service cron start
+/usr/sbin/cron -f &
 
-# Keep container alive
-tail -f /app/logs/cron.log
+# Keep container alive with sleep
+while true; do
+  sleep 60
+done
