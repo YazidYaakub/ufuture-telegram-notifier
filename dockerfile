@@ -8,17 +8,7 @@ RUN apt-get update && apt-get install -y \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Install UV globally
-RUN pip install uv
-
-# Copy project files
-COPY pyproject.toml .
-COPY uv.lock .
-
-# Install dependencies directly (no venv)
-RUN uv pip install -r /dev/stdin < <(uv pip compile pyproject.toml)
-
-# Or simpler - just install from pyproject.toml
+# Install the packages your script needs
 RUN pip install requests beautifulsoup4 lxml
 
 # Copy application file
