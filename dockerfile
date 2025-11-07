@@ -5,7 +5,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
-    dcron \
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the packages your script needs
@@ -17,12 +17,9 @@ COPY ufuture-scraper.py .
 # Create volume directories
 RUN mkdir -p /app/data /app/logs
 
-# Create cron spool directory
-RUN mkdir -p /var/spool/cron/crontabs
-
-# Copy crontab to the proper location
-COPY crontab /var/spool/cron/crontabs/root
-RUN chmod 0600 /var/spool/cron/crontabs/root
+# Copy crontab
+COPY crontab /etc/cron.d/ufuture-crontab
+RUN chmod 0644 /etc/cron.d/ufuture-crontab
 
 # Create log file with proper permissions
 RUN touch /app/logs/cron.log && chmod 666 /app/logs/cron.log
@@ -31,5 +28,5 @@ RUN touch /app/logs/cron.log && chmod 666 /app/logs/cron.log
 HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import sqlite3; sqlite3.connect('/app/data/ufuture_forums.db').execute('SELECT 1')" || exit 1
 
-# Run crond in foreground
-CMD ["crond", "-f", "-l", "2"]
+# Start cron - remove any stale PID file first
+CMD rm -f /var/run/crond.pid /var/run/cron.pid && /usr/sbin/cron -f
