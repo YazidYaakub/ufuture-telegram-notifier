@@ -1,17 +1,3 @@
-FROM ghcr.io/astral-sh/uv:latest as builder
-
-WORKDIR /app
-
-# Copy project files
-COPY pyproject.toml .
-COPY uv.lock .
-
-# Build virtual environment
-RUN uv venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN uv sync --frozen
-
-# Final stage
 FROM python:3.10-slim
 
 WORKDIR /app
@@ -22,13 +8,15 @@ RUN apt-get update && apt-get install -y \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
+# Install UV
+RUN pip install uv
 
-# Set PATH to use venv
-ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Copy project files
+COPY pyproject.toml .
+COPY uv.lock .
+
+# Install dependencies with UV
+RUN uv sync --frozen
 
 # Copy application file
 COPY ufuture-scraper.py .
