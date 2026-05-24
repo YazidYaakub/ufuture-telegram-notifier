@@ -6,7 +6,7 @@ Automatically scrape UiTM forums, detect updates, and receive Telegram notificat
 
 - 🔍 **Automatic Forum Scraping** - Scrapes all your UiTM course forums
 - 🆕 **Change Detection** - Detects new posts and topics since last run
-- 📱 **Telegram Notifications** - Get instant alerts on Telegram
+- 📱 **Telegram Notifications** - Get instant alerts with topic links and reply excerpts
 - 💾 **SQLite Database** - Stores forum state for comparison
 - 🐳 **Docker Ready** - Optimized Dockerfile for easy deployment
 - ⚡ **Fast Builds** - Uses UV package manager (10-100x faster than pip)
@@ -19,10 +19,11 @@ Automatically scrape UiTM forums, detect updates, and receive Telegram notificat
 1. Logs into UiTM forum system with your credentials
 2. Scrapes all course forums you're enrolled in
 3. Extracts week/topic information (posts, topics, latest activity)
-4. Stores data in local SQLite database
-5. Compares with previous run to detect changes
-6. Sends Telegram notification if new posts/topics found
-7. Saves current state for next comparison
+4. Optionally opens topic pages to capture topic titles, reply counts, reply excerpts, and open/reply links
+5. Stores data in local SQLite database
+6. Compares with previous run to detect changes
+7. Sends Telegram notification if new posts/topics found
+8. Saves current state for next comparison
 
 ## Quick Start
 
@@ -145,6 +146,11 @@ services:
       - LOG_DIR=/app/logs
       - REQUEST_RETRIES=3
       - REQUEST_BACKOFF_SECONDS=5
+      - SCRAPE_TOPIC_DETAILS=true
+      - TOPIC_DETAIL_LIMIT=20
+      - INCLUDE_REPLY_EXCERPTS=true
+      - REPLY_EXCERPT_LENGTH=160
+      - TELEGRAM_MAX_TOPICS_PER_MESSAGE=8
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
     
@@ -184,11 +190,18 @@ volumes:
 | `LOG_DIR` | Logs directory | `./logs` |
 | `REQUEST_RETRIES` | HTTP/DNS retry attempts | `3` |
 | `REQUEST_BACKOFF_SECONDS` | Base delay between retries | `5` |
+| `SCRAPE_TOPIC_DETAILS` | Fetch forum topic pages and reply excerpts after week overview scrape | `true` |
+| `TOPIC_DETAIL_LIMIT` | Maximum topic detail pages fetched per scraper run | `20` |
+| `INCLUDE_REPLY_EXCERPTS` | Include short reply excerpts in Telegram notifications | `true` |
+| `REPLY_EXCERPT_LENGTH` | Maximum stored/sent reply excerpt length | `160` |
+| `TELEGRAM_MAX_TOPICS_PER_MESSAGE` | Maximum topic detail blocks included per changed week | `8` |
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
 
 ## Telegram Setup
+
+Topic detail notifications include an `Open / reply` link that opens the UiTM topic page in your browser. The scraper does not post replies to UiTM; replies remain manual inside the authenticated UiTM session.
 
 ### Create Telegram Bot
 
@@ -245,6 +258,37 @@ last_updated    TIMESTAMP
 UNIQUE(course_code, week_title)
 ```
 
+### topics table
+```sql
+id              INTEGER PRIMARY KEY
+course_code     TEXT FOREIGN KEY
+week_title      TEXT
+topic_id        TEXT
+topic_title     TEXT
+topic_url       TEXT
+description     TEXT
+created_by      TEXT
+created_at      TEXT
+replies         INTEGER
+last_activity   TEXT
+status          TEXT
+last_updated    TIMESTAMP
+UNIQUE(course_code, week_title, topic_id)
+```
+
+### posts table
+```sql
+id              INTEGER PRIMARY KEY
+topic_id        TEXT
+post_id         TEXT
+parent_post_id  TEXT
+author          TEXT
+content_excerpt TEXT
+posted_time     TEXT
+last_updated    TIMESTAMP
+UNIQUE(topic_id, post_id)
+```
+
 ## How It Works
 
 ### First Run
@@ -257,21 +301,12 @@ UNIQUE(course_code, week_title)
 - Scrapes forums again
 - Compares with previous state
 - Detects: new posts, new topics, latest user activity
+- Adds topic titles, open/reply links, and recent reply excerpts when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
 
 ### State Comparison
-```json
-{
-  "course_code": "ISP610",
-  "course_name": "ISP610 Advanced Topic X",
-  "week": "Week 1: Introduction",
-  "topics": "5",
-  "posts": "12",
-  "latest_user": "Dr. Ahmad",
-  "latest_time": "07/11/2025 14:30"
-}
-```
+The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts`. Older week-only snapshot lists are still accepted and upgraded on the next successful run. On the first upgraded run, topic details enrich the notification; exact per-post diffs become available after one version-2 snapshot exists.
 
 ## Security Notes
 
@@ -340,8 +375,8 @@ If you use Technitium DNS, check its query logs, allowlist the UiTM domain if bl
 
 ## Performance
 
-- **First run:** 10-15 seconds
-- **Subsequent runs:** 8-12 seconds
+- **First run:** depends on enrolled forums and `TOPIC_DETAIL_LIMIT`
+- **Subsequent runs:** depends on enrolled forums and `TOPIC_DETAIL_LIMIT`
 - **Database size:** ~500KB per semester
 - **Build time (Docker):** ~2-5 minutes (first), ~30 seconds (cached)
 
@@ -385,6 +420,7 @@ The live scraper contacts UiTM and Telegram, so run it only when your environmen
 - Requires valid UiTM credentials
 - Scrapes only forums you're enrolled in
 - Depends on UiTM website structure (may break if they change layout)
+- Topic detail notifications are capped by `TOPIC_DETAIL_LIMIT` to avoid broad authenticated crawling
 - Telegram API rate limits apply
 
 ## Future Improvements
