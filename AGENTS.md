@@ -26,6 +26,29 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - Keep rate limits conservative. The existing scraper sleeps between course and forum requests; preserve or improve that behavior.
 - Do not store rendered pages or screenshots that may contain personal information unless the user asks and confirms the destination.
 
+## RTK Command Policy
+
+- Use `rtk` as the default wrapper for supported shell commands that may produce verbose output or benefit from token filtering.
+- Prefer explicit RTK commands over raw equivalents when inspecting files, git state, logs, tests, builds, dependency state, containers, or command output.
+
+### Preferred RTK Commands
+
+- Files/search: `rtk ls`, `rtk read`, `rtk smart`, `rtk find`, `rtk grep`, `rtk diff`
+- Git read-only: `rtk git status`, `rtk git log`, `rtk git diff`
+- Git state-changing: use `rtk git add`, `rtk git commit`, `rtk git push`, and `rtk git pull` only after user approval
+- GitHub CLI: `rtk gh pr list`, `rtk gh pr view`, `rtk gh issue list`, `rtk gh run list`
+- Tests: `rtk pytest`, `rtk playwright test`, `rtk test <cmd>`, `rtk err <cmd>`
+- Build/lint: `rtk ruff check`, `rtk lint`, `rtk prettier --check`, `rtk tsc`
+- Package/dependency inspection: `rtk pip list`, `rtk pip outdated`, `rtk deps`
+- Containers: `rtk docker ps`, `rtk docker images`, `rtk docker logs`, `rtk docker compose ps`
+- Logs/data: `rtk log`, `rtk json`, `rtk summary`, `rtk proxy`
+- RTK analytics: `rtk gain`, `rtk gain --history`, `rtk gain --daily`, `rtk discover`, `rtk session`
+
+### Fallbacks
+
+- Use raw commands only when RTK does not support the command, the RTK-filtered output is insufficient, or exact raw output is required for debugging or validation.
+- RTK does not relax repository safety rules: approval requirements, live network restrictions, secret-handling rules, and destructive-command restrictions still apply.
+
 ## Validation
 
 - After any approved implementation, validate the changed surface before reporting completion.
