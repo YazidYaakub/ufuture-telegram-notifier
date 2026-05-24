@@ -6,6 +6,8 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 
 ## Working Agreements
 
+- Default to planning mode for this repository: return an implementation plan first and wait for explicit approval before making code changes, repo changes, config changes, commits, live network calls, container actions, or deployment changes.
+- Do not make code changes, repo changes, generated file changes, dependency changes, or documentation changes without explicit user approval in the current turn. Reading files and running read-only inspection commands is allowed.
 - Do not hardcode, print, commit, or preserve secrets. This includes UiTM credentials, Telegram bot tokens, chat IDs, Crawl4AI tokens, cookies, session headers, and `.env` values.
 - Do not run the live scraper, contact UiTM, send Telegram messages, or call Crawl4AI unless the user explicitly asks for that action in the current turn.
 - Do not store secrets, credentials, cookies, personal portal data, live scrape output, database rows, or Telegram payloads in Codex memories.
@@ -26,10 +28,19 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 
 ## Validation
 
+- After any approved implementation, validate the changed surface before reporting completion.
+- After any approved implementation, run at least one smoke test that exercises the affected behavior without contacting UiTM or Telegram unless the user explicitly approved a live test.
 - For scraper-only Python changes, run at least `python -m py_compile ufuture-scraper.py scheduler.py`.
 - For dependency or Docker changes, also validate the relevant Docker or `uv` command when feasible.
 - For Codex policy changes under `.codex/`, validate JSON/TOML/Python syntax and run `codex execpolicy check` when Codex is available.
 - Report any validation that could not be run, including the reason.
+
+## Smoke Test Artifacts
+
+- Keep smoke-test files out of the remote repo by default.
+- Prefer temporary paths outside the repo for smoke-test databases, snapshots, logs, HTML captures, screenshots, or generated fixtures.
+- If a smoke-test artifact must be created in the repo, put it under an ignored path and remove it before finishing unless the user explicitly asks to keep it.
+- Before final reporting, check `git status --short` and call out any untracked smoke-test artifacts.
 
 ## Memory Policy
 
@@ -43,4 +54,3 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - Scheduler: `scheduler.py`, runs the scraper every 10 minutes in Docker.
 - Local state: `data/ufuture_forums.db` and `data/telegram_last_snapshot.json`.
 - Docker file name is `Dockerfile` to match TrueNAS/Linux case-sensitive builds.
-- README references an older script name; verify filenames before following README commands.
