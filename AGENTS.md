@@ -8,6 +8,7 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 
 - Do not hardcode, print, commit, or preserve secrets. This includes UiTM credentials, Telegram bot tokens, chat IDs, Crawl4AI tokens, cookies, session headers, and `.env` values.
 - Do not run the live scraper, contact UiTM, send Telegram messages, or call Crawl4AI unless the user explicitly asks for that action in the current turn.
+- Do not store secrets, credentials, cookies, personal portal data, live scrape output, database rows, or Telegram payloads in Codex memories.
 - Keep code changes narrow. Prefer fixing the existing single-file scraper and scheduler structure before introducing new modules.
 - Use `uv` for local Python dependency workflows when dependency commands are needed.
 - Use `rtk` for large shell output when available, especially `rtk git status`, `rtk git diff`, `rtk grep`, `rtk read`, and `rtk test`.
@@ -29,6 +30,12 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - For dependency or Docker changes, also validate the relevant Docker or `uv` command when feasible.
 - For Codex policy changes under `.codex/`, validate JSON/TOML/Python syntax and run `codex execpolicy check` when Codex is available.
 - Report any validation that could not be run, including the reason.
+
+## Memory Policy
+
+- Useful memories for this repo are stable preferences and workflow facts only: prefer RTK for large output, use `uv` for Python dependency work, keep Crawl4AI as a research/rendering fallback, and treat the existing scraper as the source of truth.
+- Do not use memories as the only source of mandatory rules. Keep required instructions in this file or other checked-in documentation.
+- If memory behavior conflicts with this file, follow this file.
 
 ## Known Repo Notes
 
