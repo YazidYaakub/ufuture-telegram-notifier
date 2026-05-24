@@ -20,7 +20,7 @@ RUN mkdir -p /app/data /app/logs
 COPY scheduler.py .
 
 # Health check
-HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 CMD python -c "import sqlite3; sqlite3.connect('/app/data/ufuture_forums.db').execute('SELECT 1')" || exit 1
+HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 CMD python -c "import os, socket, sqlite3; socket.gethostbyname('ufuture.uitm.edu.my'); sqlite3.connect(os.environ['DB_PATH']).execute('SELECT 1')" || exit 1
 
 # Run scheduler
 CMD ["python", "/app/scheduler.py"]

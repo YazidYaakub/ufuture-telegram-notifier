@@ -42,5 +42,5 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - Main scraper: `ufuture-scraper.py`.
 - Scheduler: `scheduler.py`, runs the scraper every 10 minutes in Docker.
 - Local state: `data/ufuture_forums.db` and `data/telegram_last_snapshot.json`.
-- Docker file name is currently lowercase: `dockerfile`.
+- Docker file name is `Dockerfile` to match TrueNAS/Linux case-sensitive builds.
 - README references an older script name; verify filenames before following README commands.

@@ -12,6 +12,7 @@ Automatically scrape UiTM forums, detect updates, and receive Telegram notificat
 - ⚡ **Fast Builds** - Uses UV package manager (10-100x faster than pip)
 - 🔐 **Secure** - Environment variables for credentials (no hardcoded secrets)
 - 🏠 **TrueNAS Compatible** - Ready for TrueNAS Scale deployment
+- 🧭 **DNS-aware Runtime** - Detects container DNS failures and exits non-zero instead of silently succeeding
 
 ## What It Does
 
@@ -65,7 +66,7 @@ direnv allow
 #### Run
 
 ```bash
-uv run ufuture_scraper_with_telegram_docker.py
+uv run python ufuture-scraper.py
 ```
 
 Output:
@@ -91,7 +92,7 @@ Completed: 07/11/2025 05:58:21
 ### Build Docker Image
 
 ```bash
-docker build -t ufuture-forum-scraper:latest .
+docker build -f Dockerfile -t ufuture-forum-scraper:latest .
 ```
 
 ### Run Docker Container
@@ -128,6 +129,11 @@ services:
     container_name: ufuture-forum-scraper
     hostname: ufuture-forum-scraper
     restart: unless-stopped
+
+    # Optional but recommended if your LAN DNS is filtered or unreliable.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     
     environment:
       - UFUTURE_USERNAME=your_student_id
@@ -137,18 +143,19 @@ services:
       - DB_PATH=/app/data/ufuture_forums.db
       - SNAPSHOT_PATH=/app/data/telegram_last_snapshot.json
       - LOG_DIR=/app/logs
+      - REQUEST_RETRIES=3
+      - REQUEST_BACKOFF_SECONDS=5
+      - SCRAPER_TIMEOUT_SECONDS=300
+      - SCRAPER_FAILURE_LIMIT=0
     
     volumes:
       - ufuture-data:/app/data
       - ufuture-logs:/app/logs
-    
-    restart: unless-stopped
 
 volumes:
   ufuture-data:
   ufuture-logs:
 
-version: '3.8'
 ```
 
 3. **Replace placeholders:**
@@ -175,6 +182,11 @@ version: '3.8'
 | `DB_PATH` | Database file path | `./data/ufuture_forums.db` |
 | `SNAPSHOT_PATH` | State file path | `./data/telegram_last_snapshot.json` |
 | `LOG_DIR` | Logs directory | `./logs` |
+| `REQUEST_RETRIES` | HTTP/DNS retry attempts | `3` |
+| `REQUEST_BACKOFF_SECONDS` | Base delay between retries | `5` |
+| `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
+| `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
+| `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
 
 ## Telegram Setup
 
@@ -197,7 +209,8 @@ Or use bot like **@userinfobot** to get your chat ID directly
 
 ```
 ufuture-forum-scraper/
-├── ufuture_scraper_with_telegram_docker.py  # Main application
+├── ufuture-scraper.py                       # Main application
+├── scheduler.py                             # Runs scraper every 10 minutes
 ├── Dockerfile                                # Docker build configuration
 ├── pyproject.toml                            # UV dependencies
 ├── uv.lock                                   # Locked dependency versions
@@ -291,8 +304,26 @@ UNIQUE(course_code, week_title)
 ### "Logged in failed" error
 **Solution:** Check your UiTM username and password are correct
 
+### "DNS lookup failed" or "Temporary failure in name resolution"
+**Solution:** This is a container or TrueNAS DNS problem, not a forum parser problem.
+
+Check DNS from TrueNAS and from inside the container. If public DNS works but your LAN DNS does not, add explicit DNS servers to the app YAML:
+
+```yaml
+services:
+  ufuture-forum-scraper:
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+```
+
+If you use Technitium DNS, check its query logs, allowlist the UiTM domain if blocked, confirm upstream forwarders work, and make sure TrueNAS/container subnets are allowed to query it.
+
 ### "Telegram notification failed" error
 **Solution:** Verify bot token and chat ID are correct
+
+### Container says scraper completed with non-zero code
+**Solution:** Read the scraper log immediately above that line. Exit code `75` means a temporary network or DNS failure. Exit code `2` means required configuration is missing.
 
 ### No database file created
 **Solution:** Check `DB_PATH` in environment variables is correct
@@ -319,6 +350,7 @@ UNIQUE(course_code, week_title)
 - **requests** - HTTP client for web scraping
 - **beautifulsoup4** - HTML parsing
 - **lxml** - XML/HTML parsing (faster)
+- **schedule** - Runs the scraper every 10 minutes inside the container
 
 All managed by UV package manager for reproducible builds.
 
@@ -329,8 +361,18 @@ All managed by UV package manager for reproducible builds.
 ```bash
 git pull origin main
 uv sync  # Update dependencies if needed
-uv run ufuture_scraper_with_telegram_docker.py
+uv run python ufuture-scraper.py
 ```
+
+## Validation
+
+```bash
+uv sync --frozen
+uv run python -m py_compile ufuture-scraper.py scheduler.py
+docker build -f Dockerfile -t ufuture-forum-scraper:latest .
+```
+
+The live scraper contacts UiTM and Telegram, so run it only when your environment variables are set and you intend to perform a real scrape.
 
 ### Update Docker image (TrueNAS)
 
