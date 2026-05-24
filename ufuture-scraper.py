@@ -49,6 +49,10 @@ TOPIC_DETAIL_LIMIT = int(os.getenv("TOPIC_DETAIL_LIMIT", "20"))
 INCLUDE_REPLY_EXCERPTS = os.getenv("INCLUDE_REPLY_EXCERPTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_EXCERPT_LENGTH = int(os.getenv("REPLY_EXCERPT_LENGTH", "160"))
 TELEGRAM_MAX_TOPICS_PER_MESSAGE = int(os.getenv("TELEGRAM_MAX_TOPICS_PER_MESSAGE", "8"))
+TELEGRAM_INLINE_BUTTONS = os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_DEDUP_REPLIES = os.getenv("TELEGRAM_DEDUP_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_SHORT_NAMES = os.getenv("TELEGRAM_SHORT_NAMES", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_MEDIA_BUTTONS = os.getenv("TELEGRAM_MEDIA_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -158,13 +162,25 @@ def init_db():
         parent_post_id TEXT,
         author TEXT,
         content_excerpt TEXT,
+        media_url TEXT,
+        media_label TEXT,
         posted_time TEXT,
         last_updated TIMESTAMP,
         UNIQUE(topic_id, post_id)
     )''')
+
+    ensure_column(c, "posts", "media_url", "TEXT")
+    ensure_column(c, "posts", "media_label", "TEXT")
     
     conn.commit()
     return conn
+
+
+def ensure_column(cursor, table, column, definition):
+    cursor.execute(f"PRAGMA table_info({table})")
+    columns = {row[1] for row in cursor.fetchall()}
+    if column not in columns:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 # ============================================================================
 # SCRAPING FUNCTIONS
@@ -329,6 +345,20 @@ def truncate_text(value, limit=None):
     return text[: limit - 1].rstrip() + "…"
 
 
+def pluralize(count, singular, plural=None):
+    return singular if count == 1 else (plural or f"{singular}s")
+
+
+def short_display_name(name):
+    text = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not TELEGRAM_SHORT_NAMES:
+        return text
+
+    stop_words = {"BIN", "BINTI", "BT", "B", "A/L", "A/P"}
+    parts = [part for part in text.split() if part.upper() not in stop_words]
+    return " ".join(parts[:3]) if parts else text
+
+
 def first_regex(text, pattern, default=""):
     match = re.search(pattern, text or "", re.IGNORECASE)
     return match.group(1).strip() if match else default
@@ -450,6 +480,65 @@ def extract_posted_time(actions):
     return first_regex(actions_text, r"Posted\s+(.+?)(?:\s+Reply|$)")
 
 
+def media_label_from_url(url):
+    path = urlparse(url or "").path
+    filename = os.path.basename(path)
+    return filename or "Media"
+
+
+def extract_media_link(body, reply_div):
+    containers = [reply_div, body]
+    seen = set()
+    media_extensions = (
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc", ".docx",
+        ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".mp4", ".mov",
+        ".mp3", ".wav",
+    )
+
+    for container in containers:
+        if not container:
+            continue
+
+        for img in container.find_all("img", src=True):
+            src = img.get("src", "").strip()
+            if not src:
+                continue
+            media_url = urljoin(BASE_URL, src)
+            return media_url, img.get("alt") or media_label_from_url(media_url)
+
+        for anchor in container.find_all("a", href=True):
+            href = anchor.get("href", "").strip()
+            if not href or href in seen:
+                continue
+            seen.add(href)
+
+            href_lower = href.lower()
+            classes = anchor.get("class") or []
+            text = normalize_text(anchor)
+            if (
+                "open-DialogReply" in classes
+                or href_lower.startswith("#")
+                or href_lower.startswith("javascript:")
+                or href_lower.startswith("mailto:")
+            ):
+                continue
+
+            looks_like_media = (
+                any(urlparse(href_lower).path.endswith(ext) for ext in media_extensions)
+                or "download" in href_lower
+                or "attachment" in href_lower
+                or "file" in href_lower
+                or "media" in href_lower
+            )
+            if not looks_like_media:
+                continue
+
+            media_url = urljoin(BASE_URL, href)
+            return media_url, text or media_label_from_url(media_url)
+
+    return "", ""
+
+
 def extract_topic_posts(soup, topic_id):
     card = find_main_card(soup)
     posts = []
@@ -473,6 +562,7 @@ def extract_topic_posts(soup, topic_id):
         post_id = reply_link.get("data-id") if reply_link else ""
         if not post_id:
             post_id = stable_post_id(topic_id, author, posted_time, content)
+        media_url, media_label = extract_media_link(body, reply_div)
 
         if post_id not in seen and (content or author or posted_time):
             posts.append({
@@ -481,6 +571,8 @@ def extract_topic_posts(soup, topic_id):
                 "parent_post_id": parent_post_id or "",
                 "author": author or "Unknown",
                 "content_excerpt": truncate_text(content),
+                "media_url": media_url,
+                "media_label": media_label,
                 "posted_time": posted_time,
             })
             seen.add(post_id)
@@ -586,10 +678,11 @@ def save_to_db(conn, courses, all_results, topic_details=None, post_details=None
     for post in post_details or []:
         c.execute('''INSERT OR REPLACE INTO posts
                     (topic_id, post_id, parent_post_id, author, content_excerpt,
-                     posted_time, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                     media_url, media_label, posted_time, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                  (post['topic_id'], post['post_id'], post.get('parent_post_id', ''),
                   post.get('author', ''), post.get('content_excerpt', ''),
+                  post.get('media_url', ''), post.get('media_label', ''),
                   post.get('posted_time', ''), now))
     
     conn.commit()
@@ -669,7 +762,8 @@ def get_current_post_state(conn, topic_ids=None):
         where_clause = f" WHERE t.topic_id IN ({placeholders})"
 
     c.execute(f'''SELECT t.course_code, t.week_title, t.topic_id, t.topic_title, t.topic_url,
-                         p.post_id, p.parent_post_id, p.author, p.content_excerpt, p.posted_time, p.id
+                         p.post_id, p.parent_post_id, p.author, p.content_excerpt,
+                         p.media_url, p.media_label, p.posted_time, p.id
                   FROM posts p
                   JOIN topics t ON p.topic_id = t.topic_id
                   {where_clause}
@@ -687,7 +781,9 @@ def get_current_post_state(conn, topic_ids=None):
             'parent_post_id': row[6],
             'author': row[7],
             'content_excerpt': row[8],
-            'posted_time': row[9],
+            'media_url': row[9],
+            'media_label': row[10],
+            'posted_time': row[11],
         })
     return data
 
@@ -822,6 +918,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 continue
 
             latest_posts = new_posts or topic_posts[-2:]
+            media_post = next((post for post in topic_posts if post.get("media_url")), None)
             details.append({
                 "topic_id": topic["topic_id"],
                 "topic_title": topic.get("topic_title", ""),
@@ -834,12 +931,15 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 "new_topic": is_new_topic,
                 "new_posts": len(new_posts),
                 "posts": latest_posts[-3:],
+                "media_url": media_post.get("media_url", "") if media_post else "",
+                "media_label": media_post.get("media_label", "") if media_post else "",
                 "exact_post_diff": has_detail_history,
             })
 
         if not details:
             for topic in week_topics[:topic_limit]:
                 topic_posts = posts_by_topic.get(topic["topic_id"], [])
+                media_post = next((post for post in topic_posts if post.get("media_url")), None)
                 details.append({
                     "topic_id": topic["topic_id"],
                     "topic_title": topic.get("topic_title", ""),
@@ -852,6 +952,8 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                     "new_topic": False,
                     "new_posts": 0,
                     "posts": topic_posts[-2:],
+                    "media_url": media_post.get("media_url", "") if media_post else "",
+                    "media_label": media_post.get("media_label", "") if media_post else "",
                     "exact_post_diff": has_detail_history,
                 })
 
@@ -876,58 +978,133 @@ def topic_link(topic):
     return title
 
 
-def build_change_block(change):
+def course_display_name(change):
+    course_code = str(change.get("course_code") or "").strip()
+    course_name = str(change.get("course_name") or "").strip()
+    if course_name.upper().startswith(course_code.upper()):
+        course_name = course_name[len(course_code):].strip(" -:–—")
+    return course_name or str(change.get("course_name") or "")
+
+
+def format_count(count, noun, plural=None):
+    return f"{count} {pluralize(count, noun, plural)}"
+
+
+def grouped_posts(posts):
+    if not TELEGRAM_DEDUP_REPLIES:
+        return [
+            {
+                "author": post.get("author") or "Unknown",
+                "content_excerpt": post.get("content_excerpt") or "",
+                "posted_time": post.get("posted_time") or "",
+                "count": 1,
+            }
+            for post in posts
+        ]
+
+    grouped = []
+    index_by_key = {}
+    for post in posts:
+        key = (
+            post.get("author") or "Unknown",
+            post.get("content_excerpt") or "",
+        )
+        if key in index_by_key:
+            item = grouped[index_by_key[key]]
+            item["count"] += 1
+            if post.get("posted_time"):
+                item["posted_time"] = post.get("posted_time")
+            continue
+        index_by_key[key] = len(grouped)
+        grouped.append({
+            "author": post.get("author") or "Unknown",
+            "content_excerpt": post.get("content_excerpt") or "",
+            "posted_time": post.get("posted_time") or "",
+            "count": 1,
+        })
+    return grouped
+
+
+def topic_button_suffix(index, total):
+    return f" {index}" if total > 1 else ""
+
+
+def build_inline_keyboard(change):
+    if not TELEGRAM_INLINE_BUTTONS:
+        return None
+
+    topic_details = [topic for topic in change.get("topic_details", []) if topic.get("topic_url")]
+    if not topic_details:
+        return None
+
+    total = len(topic_details)
+    rows = []
+    for index, topic in enumerate(topic_details, start=1):
+        suffix = topic_button_suffix(index, total)
+        row = [
+            {"text": f"Reply{suffix}", "url": topic["topic_url"]},
+            {"text": f"Details{suffix}", "url": topic["topic_url"]},
+        ]
+        if TELEGRAM_MEDIA_BUTTONS and topic.get("media_url"):
+            row.append({"text": f"Media{suffix}", "url": topic["media_url"]})
+        rows.append(row)
+
+    return {"inline_keyboard": rows}
+
+
+def build_change_block(change, *, number_topics=False):
+    course_name = course_display_name(change)
     lines = [
-        f"📚 <b>{html_text(change['course_code'])}</b>",
-        f"   {html_text(change['course_name'])}",
-        f"   Week: {html_text(change['week'])}",
+        f"📚 <b>{html_text(change['course_code'])}</b> — {html_text(course_name)}",
+        f"{html_text(change['week'])}",
     ]
 
+    summary = []
     if change['new_topics'] > 0:
-        lines.append(f"   🆕 {change['new_topics']} new topic(s)")
+        summary.append(f"🆕 {format_count(change['new_topics'], 'new topic')}")
     if change['new_posts'] > 0:
-        lines.append(f"   💬 {change['new_posts']} new post(s)")
-
-    lines.append(f"   👤 {html_text(change['latest_user'])}")
-    lines.append(f"   🕐 {html_text(change['latest_time'])}")
+        summary.append(f"💬 {format_count(change['new_posts'], 'new post')}")
+    summary.append(f"👤 {html_text(short_display_name(change['latest_user']))}")
+    summary.append(f"🕐 {html_text(change['latest_time'])}")
+    lines.append(" · ".join(summary))
 
     topic_details = change.get("topic_details") or []
-    for topic in topic_details:
+    for index, topic in enumerate(topic_details, start=1):
+        topic_prefix = f"{index}. " if number_topics and len(topic_details) > 1 else ""
         lines.append("")
-        lines.append(f"   🧵 {topic_link(topic)}")
+        lines.append(f"{topic_prefix}🧵 {topic_link(topic)}")
         if topic.get("new_topic"):
-            lines.append("      🆕 New topic")
+            lines.append("🆕 New topic")
         if topic.get("exact_post_diff") and topic.get("new_posts"):
-            lines.append(f"      💬 {topic['new_posts']} new reply/replies")
+            lines.append(f"💬 {format_count(topic['new_posts'], 'new reply', 'new replies')}")
         elif topic.get("replies") is not None:
-            lines.append(f"      💬 {topic.get('replies', 0)} total reply/replies")
+            lines.append(f"💬 {format_count(topic.get('replies', 0), 'total reply', 'total replies')}")
 
-        if topic.get("last_activity"):
-            lines.append(f"      🕐 {html_text(topic['last_activity'])}")
-
+        showed_posts = False
         if INCLUDE_REPLY_EXCERPTS:
-            for post in topic.get("posts", []):
-                author = html_text(post.get("author") or "Unknown")
+            for post in grouped_posts(topic.get("posts", [])):
+                author = html_text(short_display_name(post.get("author") or "Unknown"))
                 posted_time = html_text(post.get("posted_time") or "-")
                 excerpt = html_text(post.get("content_excerpt") or "")
                 if excerpt:
-                    lines.append(f"      ↳ {author}: {excerpt}")
-                    lines.append(f"        {posted_time}")
+                    suffix = f" ×{post['count']}" if post.get("count", 1) > 1 else ""
+                    lines.append(f"↳ {author}: {excerpt}{suffix}")
+                    lines.append(f"  {posted_time}")
+                    showed_posts = True
 
-        if topic.get("topic_url"):
-            lines.append(f"      ↪️ Open / reply: {topic_link(topic)}")
+        if not showed_posts and topic.get("last_activity"):
+            lines.append(f"🕐 {html_text(topic['last_activity'])}")
 
     if change.get("topic_details_truncated"):
         lines.append("")
-        lines.append("   … more changed topics omitted by TELEGRAM_MAX_TOPICS_PER_MESSAGE")
+        lines.append("… more changed topics omitted by TELEGRAM_MAX_TOPICS_PER_MESSAGE")
 
     return "\n".join(lines)
 
 
-def build_telegram_messages(changes):
+def chunk_telegram_text_blocks(blocks):
     header = "🔔 <b>Forum Updates Detected!</b>"
     footer = f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-    blocks = [build_change_block(change) for change in changes]
     max_length = 3900
     messages = []
     current = header
@@ -968,23 +1145,60 @@ def build_telegram_messages(changes):
     return messages
 
 
+def build_telegram_payloads(changes):
+    if TELEGRAM_INLINE_BUTTONS:
+        payloads = []
+        for change in changes:
+            block = build_change_block(change, number_topics=True)
+            text = "\n\n".join([
+                "🔔 <b>Forum Updates Detected!</b>",
+                block,
+                f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+            ])
+            keyboard = build_inline_keyboard(change)
+            if len(text) <= 3900:
+                payload = {"text": text}
+                if keyboard:
+                    payload["reply_markup"] = keyboard
+                payloads.append(payload)
+                continue
+
+            chunks = chunk_telegram_text_blocks([block])
+            for index, chunk in enumerate(chunks):
+                payload = {"text": chunk}
+                if index == 0 and keyboard:
+                    payload["reply_markup"] = keyboard
+                payloads.append(payload)
+        return payloads
+
+    return [{"text": message} for message in chunk_telegram_text_blocks(
+        [build_change_block(change) for change in changes]
+    )]
+
+
+def build_telegram_messages(changes):
+    return [payload["text"] for payload in build_telegram_payloads(changes)]
+
+
 def send_telegram_notification(changes):
     """Send Telegram notification"""
     if not TELEGRAM_ENABLED or not changes:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    messages = build_telegram_messages(changes)
+    payloads = build_telegram_payloads(changes)
     sent = 0
 
     try:
-        for message in messages:
+        for payload in payloads:
             data = {
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
+                "text": payload["text"],
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
+            if payload.get("reply_markup"):
+                data["reply_markup"] = json.dumps(payload["reply_markup"])
             response = requests.post(url, data=data, timeout=10)
             if response.status_code != 200:
                 print(f"Failed to send Telegram notification: HTTP {response.status_code}")

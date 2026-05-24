@@ -6,7 +6,7 @@ Automatically scrape UiTM forums, detect updates, and receive Telegram notificat
 
 - 🔍 **Automatic Forum Scraping** - Scrapes all your UiTM course forums
 - 🆕 **Change Detection** - Detects new posts and topics since last run
-- 📱 **Telegram Notifications** - Get instant alerts with topic links and reply excerpts
+- 📱 **Telegram Notifications** - Get instant alerts with topic buttons and reply excerpts
 - 💾 **SQLite Database** - Stores forum state for comparison
 - 🐳 **Docker Ready** - Optimized Dockerfile for easy deployment
 - ⚡ **Fast Builds** - Uses UV package manager (10-100x faster than pip)
@@ -151,6 +151,10 @@ services:
       - INCLUDE_REPLY_EXCERPTS=true
       - REPLY_EXCERPT_LENGTH=160
       - TELEGRAM_MAX_TOPICS_PER_MESSAGE=8
+      - TELEGRAM_INLINE_BUTTONS=true
+      - TELEGRAM_DEDUP_REPLIES=true
+      - TELEGRAM_SHORT_NAMES=true
+      - TELEGRAM_MEDIA_BUTTONS=true
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
     
@@ -195,13 +199,17 @@ volumes:
 | `INCLUDE_REPLY_EXCERPTS` | Include short reply excerpts in Telegram notifications | `true` |
 | `REPLY_EXCERPT_LENGTH` | Maximum stored/sent reply excerpt length | `160` |
 | `TELEGRAM_MAX_TOPICS_PER_MESSAGE` | Maximum topic detail blocks included per changed week | `8` |
+| `TELEGRAM_INLINE_BUTTONS` | Add Telegram inline URL buttons for changed topics | `true` |
+| `TELEGRAM_DEDUP_REPLIES` | Compact repeated identical reply excerpts with a multiplier | `true` |
+| `TELEGRAM_SHORT_NAMES` | Shorten long display names in the main notification | `true` |
+| `TELEGRAM_MEDIA_BUTTONS` | Show a media button when a media/attachment URL is detected | `true` |
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
 
 ## Telegram Setup
 
-Topic detail notifications include an `Open / reply` link that opens the UiTM topic page in your browser. The scraper does not post replies to UiTM; replies remain manual inside the authenticated UiTM session.
+Topic detail notifications can include inline buttons. `Reply` and `Details` open the UiTM topic page in your browser. `Media` appears only when a media or attachment URL is detected. The scraper does not post replies to UiTM; replies remain manual inside the authenticated UiTM session.
 
 ### Create Telegram Bot
 
@@ -284,6 +292,8 @@ post_id         TEXT
 parent_post_id  TEXT
 author          TEXT
 content_excerpt TEXT
+media_url       TEXT
+media_label     TEXT
 posted_time     TEXT
 last_updated    TIMESTAMP
 UNIQUE(topic_id, post_id)
@@ -301,7 +311,7 @@ UNIQUE(topic_id, post_id)
 - Scrapes forums again
 - Compares with previous state
 - Detects: new posts, new topics, latest user activity
-- Adds topic titles, open/reply links, and recent reply excerpts when topic detail scraping is enabled
+- Adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
 
