@@ -329,7 +329,7 @@ UNIQUE(topic_id, post_id)
 - Scrapes forums again
 - Compares with previous state
 - Detects: new posts, new topics, latest user activity
-- Adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
+- Prioritizes changed weeks before spending the topic detail limit, then adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
 
