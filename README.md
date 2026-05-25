@@ -155,6 +155,13 @@ services:
       - TELEGRAM_DEDUP_REPLIES=true
       - TELEGRAM_SHORT_NAMES=true
       - TELEGRAM_MEDIA_BUTTONS=true
+      - TELEGRAM_INTERACTIVE_BOT=true
+      - TELEGRAM_BUTTON_MODE=hybrid
+      - TELEGRAM_ACTION_TTL_HOURS=72
+      - TELEGRAM_REPLY_DRAFT_TTL_HOURS=24
+      - TELEGRAM_BOT_RESTART_SECONDS=5
+      - TELEGRAM_DROP_PENDING_UPDATES=true
+      - UFUTURE_POST_REPLIES=false
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
     
@@ -203,13 +210,22 @@ volumes:
 | `TELEGRAM_DEDUP_REPLIES` | Compact repeated identical reply excerpts with a multiplier | `true` |
 | `TELEGRAM_SHORT_NAMES` | Shorten long display names in the main notification | `true` |
 | `TELEGRAM_MEDIA_BUTTONS` | Show a media button when a media/attachment URL is detected | `true` |
+| `TELEGRAM_INTERACTIVE_BOT` | Run the long-polling interactive Telegram bot worker | `true` |
+| `TELEGRAM_BUTTON_MODE` | Button behavior; `hybrid` uses callback buttons for Details/Reply and URL buttons for Media/Open | `hybrid` |
+| `TELEGRAM_ACTION_TTL_HOURS` | How long notification callback actions remain valid | `72` |
+| `TELEGRAM_REPLY_DRAFT_TTL_HOURS` | How long pending Telegram reply drafts remain valid | `24` |
+| `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
+| `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
+| `UFUTURE_POST_REPLIES` | Reserved for future confirmed UiTM posting; keep disabled in phase 1 | `false` |
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
 
 ## Telegram Setup
 
-Topic detail notifications can include inline buttons. `Reply` and `Details` open the UiTM topic page in your browser. `Media` appears only when a media or attachment URL is detected. The scraper does not post replies to UiTM; replies remain manual inside the authenticated UiTM session.
+Topic detail notifications can include inline buttons. In `hybrid` mode, `Details` and `Reply` are Telegram callback buttons handled inside the chat, while `Media` and `Open` remain URL buttons. `Media` appears only when a media or attachment URL is detected. Phase 1 never posts replies to UiTM; reply text is saved as a local Telegram draft only.
+
+The container runs a small supervisor that starts both the scraper scheduler and the interactive Telegram bot worker. The bot uses Telegram long polling, stores its update offset in SQLite, and only responds to the configured `TELEGRAM_CHAT_ID`.
 
 ### Create Telegram Bot
 
@@ -232,6 +248,8 @@ Or use bot like **@userinfobot** to get your chat ID directly
 ufuture-forum-scraper/
 ├── ufuture-scraper.py                       # Main application
 ├── scheduler.py                             # Runs scraper every 10 minutes
+├── telegram_interactive_bot.py              # Handles Telegram callback buttons and reply drafts
+├── supervisor.py                            # Runs scheduler and interactive bot in one container
 ├── Dockerfile                                # Docker build configuration
 ├── pyproject.toml                            # UV dependencies
 ├── uv.lock                                   # Locked dependency versions
@@ -317,6 +335,14 @@ UNIQUE(topic_id, post_id)
 
 ### State Comparison
 The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts`. Older week-only snapshot lists are still accepted and upgraded on the next successful run. On the first upgraded run, topic details enrich the notification; exact per-post diffs become available after one version-2 snapshot exists.
+
+### Interactive Telegram Bot
+- `Details` shows stored topic/reply context inside Telegram.
+- `Reply` starts a Telegram draft flow and previews the message.
+- `Save Draft` stores the draft locally only.
+- `Media` opens the detected media/attachment URL instead of downloading it into Telegram.
+- `Open` opens the UiTM topic page.
+- UiTM posting is intentionally disabled while `UFUTURE_POST_REPLIES=false`.
 
 ## Security Notes
 
@@ -418,6 +444,12 @@ docker build -f Dockerfile -t ufuture-forum-scraper:latest .
 ```
 
 The live scraper contacts UiTM and Telegram, so run it only when your environment variables are set and you intend to perform a real scrape.
+
+For interactive-bot branch changes, also validate:
+
+```bash
+uv run python -m py_compile telegram_interactive_bot.py supervisor.py
+```
 
 ### Update Docker image (TrueNAS)
 

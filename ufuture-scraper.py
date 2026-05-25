@@ -9,12 +9,13 @@ import re
 import socket
 import time
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import sys
 import html
 import hashlib
+import secrets
 from requests import RequestException
 
 # Fix Python 3.12+ deprecation warning
@@ -53,6 +54,11 @@ TELEGRAM_INLINE_BUTTONS = os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().l
 TELEGRAM_DEDUP_REPLIES = os.getenv("TELEGRAM_DEDUP_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_SHORT_NAMES = os.getenv("TELEGRAM_SHORT_NAMES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_MEDIA_BUTTONS = os.getenv("TELEGRAM_MEDIA_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_BUTTON_MODE = os.getenv("TELEGRAM_BUTTON_MODE", "hybrid").strip().lower()
+TELEGRAM_ACTION_TTL_HOURS = int(os.getenv("TELEGRAM_ACTION_TTL_HOURS", "72"))
+TELEGRAM_REPLY_DRAFT_TTL_HOURS = int(os.getenv("TELEGRAM_REPLY_DRAFT_TTL_HOURS", "24"))
+TELEGRAM_INTERACTIVE_BOT = os.getenv("TELEGRAM_INTERACTIVE_BOT", "true").strip().lower() in {"1", "true", "yes", "on"}
+UFUTURE_POST_REPLIES = os.getenv("UFUTURE_POST_REPLIES", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -171,6 +177,42 @@ def init_db():
 
     ensure_column(c, "posts", "media_url", "TEXT")
     ensure_column(c, "posts", "media_label", "TEXT")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_actions (
+        action_id TEXT PRIMARY KEY,
+        action_type TEXT NOT NULL,
+        chat_id TEXT,
+        message_id TEXT,
+        course_code TEXT,
+        week_title TEXT,
+        topic_id TEXT,
+        post_id TEXT,
+        topic_url TEXT,
+        media_url TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        payload_json TEXT
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_pending_replies (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        topic_id TEXT NOT NULL,
+        post_id TEXT,
+        topic_title TEXT,
+        draft_text TEXT,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
     
     conn.commit()
     return conn
@@ -1029,7 +1071,42 @@ def topic_button_suffix(index, total):
     return f" {index}" if total > 1 else ""
 
 
-def build_inline_keyboard(change):
+def callback_buttons_enabled(conn=None):
+    return (
+        TELEGRAM_INTERACTIVE_BOT
+        and conn is not None
+        and TELEGRAM_BUTTON_MODE in {"callback", "hybrid"}
+    )
+
+
+def create_telegram_action(conn, action_type, change, topic):
+    now = datetime.now()
+    expires_at = now + timedelta(hours=max(1, TELEGRAM_ACTION_TTL_HOURS))
+    action_id = secrets.token_urlsafe(8)
+    payload = {
+        "change": {
+            "course_code": change.get("course_code"),
+            "course_name": change.get("course_name"),
+            "week": change.get("week"),
+            "latest_user": change.get("latest_user"),
+            "latest_time": change.get("latest_time"),
+        },
+        "topic": topic,
+    }
+    conn.execute('''INSERT INTO telegram_actions
+                   (action_id, action_type, chat_id, course_code, week_title,
+                    topic_id, post_id, topic_url, media_url, created_at,
+                    expires_at, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (action_id, action_type, TELEGRAM_CHAT_ID,
+                  change.get("course_code", ""), change.get("week", ""),
+                  topic.get("topic_id", ""), "", topic.get("topic_url", ""),
+                  topic.get("media_url", ""), now.isoformat(),
+                  expires_at.isoformat(), json.dumps(payload)))
+    return action_id
+
+
+def build_inline_keyboard(change, conn=None):
     if not TELEGRAM_INLINE_BUTTONS:
         return None
 
@@ -1039,15 +1116,28 @@ def build_inline_keyboard(change):
 
     total = len(topic_details)
     rows = []
+    use_callbacks = callback_buttons_enabled(conn)
     for index, topic in enumerate(topic_details, start=1):
         suffix = topic_button_suffix(index, total)
-        row = [
-            {"text": f"Reply{suffix}", "url": topic["topic_url"]},
-            {"text": f"Details{suffix}", "url": topic["topic_url"]},
-        ]
+        if use_callbacks:
+            details_id = create_telegram_action(conn, "details", change, topic)
+            reply_id = create_telegram_action(conn, "reply", change, topic)
+            row = [
+                {"text": f"Details{suffix}", "callback_data": f"d:{details_id}"},
+                {"text": f"Reply{suffix}", "callback_data": f"r:{reply_id}"},
+            ]
+        else:
+            row = [
+                {"text": f"Details{suffix}", "url": topic["topic_url"]},
+                {"text": f"Reply{suffix}", "url": topic["topic_url"]},
+            ]
         if TELEGRAM_MEDIA_BUTTONS and topic.get("media_url"):
             row.append({"text": f"Media{suffix}", "url": topic["media_url"]})
+        row.append({"text": f"Open{suffix}", "url": topic["topic_url"]})
         rows.append(row)
+
+    if use_callbacks:
+        conn.commit()
 
     return {"inline_keyboard": rows}
 
@@ -1145,7 +1235,7 @@ def chunk_telegram_text_blocks(blocks):
     return messages
 
 
-def build_telegram_payloads(changes):
+def build_telegram_payloads(changes, conn=None):
     if TELEGRAM_INLINE_BUTTONS:
         payloads = []
         for change in changes:
@@ -1155,7 +1245,7 @@ def build_telegram_payloads(changes):
                 block,
                 f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
             ])
-            keyboard = build_inline_keyboard(change)
+            keyboard = build_inline_keyboard(change, conn)
             if len(text) <= 3900:
                 payload = {"text": text}
                 if keyboard:
@@ -1180,13 +1270,13 @@ def build_telegram_messages(changes):
     return [payload["text"] for payload in build_telegram_payloads(changes)]
 
 
-def send_telegram_notification(changes):
+def send_telegram_notification(changes, conn=None):
     """Send Telegram notification"""
     if not TELEGRAM_ENABLED or not changes:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payloads = build_telegram_payloads(changes)
+    payloads = build_telegram_payloads(changes, conn)
     sent = 0
 
     try:
@@ -1361,7 +1451,7 @@ def run_scrape():
         for change in changes:
             print(f"{change['course_code']}: {change['new_posts']} new post(s), {change['new_topics']} new topic(s)")
         print()
-        send_telegram_notification(changes)
+        send_telegram_notification(changes, conn)
     else:
         if last_snapshot:
             print("No changes detected\n")
