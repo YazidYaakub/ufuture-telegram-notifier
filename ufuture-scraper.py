@@ -630,7 +630,37 @@ def extract_topic_posts(soup, topic_id):
     return posts
 
 
-def scrape_topic_details(session, all_results):
+def ordered_topic_detail_weeks(all_results, priority_changes=None):
+    priority_keys = []
+    for change in priority_changes or []:
+        key = (change.get("course_code"), change.get("week"))
+        if key not in priority_keys:
+            priority_keys.append(key)
+
+    week_items = []
+    for course_code, weeks in all_results.items():
+        for week in weeks:
+            week_items.append((course_code, week))
+
+    ordered = []
+    seen = set()
+    for key in priority_keys:
+        for course_code, week in week_items:
+            item_key = (course_code, week.get("week"))
+            if item_key == key and item_key not in seen:
+                ordered.append((course_code, week, True))
+                seen.add(item_key)
+
+    for course_code, week in week_items:
+        item_key = (course_code, week.get("week"))
+        if item_key not in seen:
+            ordered.append((course_code, week, False))
+            seen.add(item_key)
+
+    return ordered
+
+
+def scrape_topic_details(session, all_results, priority_changes=None):
     if not SCRAPE_TOPIC_DETAILS or TOPIC_DETAIL_LIMIT <= 0:
         return [], []
 
@@ -638,45 +668,48 @@ def scrape_topic_details(session, all_results):
     posts = []
     seen_topics = set()
     fetched_topics = 0
+    priority_count = len(priority_changes or [])
+    if priority_count:
+        print(f"Prioritizing {priority_count} changed week(s) for topic detail scraping")
 
-    for course_code, weeks in all_results.items():
-        for week in weeks:
-            if fetched_topics >= TOPIC_DETAIL_LIMIT:
-                break
-            if parse_count(week.get("topics")) <= 0 and parse_count(week.get("posts")) <= 0:
-                continue
+    for course_code, week, is_priority in ordered_topic_detail_weeks(all_results, priority_changes):
+        if fetched_topics >= TOPIC_DETAIL_LIMIT:
+            break
+        if parse_count(week.get("topics")) <= 0 and parse_count(week.get("posts")) <= 0:
+            continue
 
-            try:
-                week_response = request_with_retries(
+        try:
+            context_prefix = "changed " if is_priority else ""
+            week_response = request_with_retries(
+                session,
+                "GET",
+                week["week_link"],
+                context=f"Fetch {context_prefix}topic list for {course_code} {week['week']}",
+                timeout=30,
+            )
+            week_topics = extract_week_topics(safe_soup(week_response.text), course_code, week["week"])
+            for topic in week_topics:
+                if fetched_topics >= TOPIC_DETAIL_LIMIT:
+                    break
+                if topic["topic_id"] in seen_topics:
+                    continue
+
+                topics.append(topic)
+                seen_topics.add(topic["topic_id"])
+
+                topic_response = request_with_retries(
                     session,
                     "GET",
-                    week["week_link"],
-                    context=f"Fetch topic list for {course_code} {week['week']}",
+                    topic["topic_url"],
+                    context=f"Fetch topic detail for {course_code} {topic['topic_title']}",
                     timeout=30,
                 )
-                week_topics = extract_week_topics(safe_soup(week_response.text), course_code, week["week"])
-                for topic in week_topics:
-                    if fetched_topics >= TOPIC_DETAIL_LIMIT:
-                        break
-                    if topic["topic_id"] in seen_topics:
-                        continue
-
-                    topics.append(topic)
-                    seen_topics.add(topic["topic_id"])
-
-                    topic_response = request_with_retries(
-                        session,
-                        "GET",
-                        topic["topic_url"],
-                        context=f"Fetch topic detail for {course_code} {topic['topic_title']}",
-                        timeout=30,
-                    )
-                    posts.extend(extract_topic_posts(safe_soup(topic_response.text), topic["topic_id"]))
-                    fetched_topics += 1
-                    time.sleep(0.5)
-            except ScraperError as error:
-                print(f"Skipping topic details for {course_code} {week['week']}: {error}")
-            time.sleep(0.4)
+                posts.extend(extract_topic_posts(safe_soup(topic_response.text), topic["topic_id"]))
+                fetched_topics += 1
+                time.sleep(0.5)
+        except ScraperError as error:
+            print(f"Skipping topic details for {course_code} {week['week']}: {error}")
+        time.sleep(0.4)
 
     print(f"Extracted {len(topics)} topic detail row(s), {len(posts)} post row(s)")
     return topics, posts
@@ -737,7 +770,8 @@ def get_current_state(conn):
     """Get current forum state from database"""
     c = conn.cursor()
     
-    c.execute('''SELECT c.course_code, c.course_name, w.week_title, w.topics, w.posts, w.latest_user, w.latest_time
+    c.execute('''SELECT c.course_code, c.course_name, w.week_title, w.week_link,
+                        w.topics, w.posts, w.latest_user, w.latest_time
                  FROM weeks w
                  JOIN courses c ON w.course_code = c.course_code
                  ORDER BY c.course_code, w.week_title''')
@@ -748,10 +782,11 @@ def get_current_state(conn):
             'course_code': row[0],
             'course_name': row[1],
             'week': row[2],
-            'topics': row[3],
-            'posts': row[4],
-            'latest_user': row[5],
-            'latest_time': row[6]
+            'week_link': row[3],
+            'topics': row[4],
+            'posts': row[5],
+            'latest_user': row[6],
+            'latest_time': row[7]
         })
     
     return data
@@ -910,7 +945,8 @@ def detect_changes(current, last):
                         'total_posts': curr_posts,
                         'total_topics': curr_topics,
                         'latest_user': curr_item['latest_user'],
-                        'latest_time': curr_item['latest_time']
+                        'latest_time': curr_item['latest_time'],
+                        'week_link': curr_item.get('week_link', '')
                     })
             except (KeyError, TypeError, ValueError) as error:
                 print(f"Skipping invalid snapshot row for {key}: {error}")
@@ -1112,6 +1148,8 @@ def build_inline_keyboard(change, conn=None):
 
     topic_details = [topic for topic in change.get("topic_details", []) if topic.get("topic_url")]
     if not topic_details:
+        if change.get("week_link"):
+            return {"inline_keyboard": [[{"text": "Open week", "url": change["week_link"]}]]}
         return None
 
     total = len(topic_details)
@@ -1423,23 +1461,27 @@ def run_scrape():
         conn.close()
         raise ScraperError("No forum week rows extracted. Refusing to update database or snapshot.")
 
-    # Extract topic/post details after the week overview has succeeded.
-    topic_details, post_details = scrape_topic_details(s, all_results)
+    # Save week overview first so changes can be detected before spending the topic detail limit.
+    save_to_db(conn, courses, all_results)
 
-    # Save to database
-    save_to_db(conn, courses, all_results, topic_details, post_details)
-    print(f"Saved to database: {DB_FILE}")
-    
-    # Get current state
+    # Get current week state
     current = get_current_state(conn)
-    fetched_topic_ids = [topic["topic_id"] for topic in topic_details]
-    current_topics = get_current_topic_state(conn, fetched_topic_ids)
-    current_posts = get_current_post_state(conn, fetched_topic_ids)
-    
-    # Check for changes
+
+    # Check for week-level changes before topic detail scraping.
     last_snapshot = load_last_snapshot()
     last_weeks = last_snapshot.get("weeks", []) if last_snapshot else None
     changes = detect_changes(current, last_weeks)
+
+    # Extract topic/post details after the week overview has succeeded.
+    topic_details, post_details = scrape_topic_details(s, all_results, changes)
+
+    # Save topic details to database.
+    save_to_db(conn, courses, all_results, topic_details, post_details)
+    print(f"Saved to database: {DB_FILE}")
+
+    fetched_topic_ids = [topic["topic_id"] for topic in topic_details]
+    current_topics = get_current_topic_state(conn, fetched_topic_ids)
+    current_posts = get_current_post_state(conn, fetched_topic_ids)
     changes = attach_topic_details(changes, current_topics, current_posts, last_snapshot)
     
     # Display results
