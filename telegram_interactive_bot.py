@@ -1,4 +1,5 @@
 import html
+import hashlib
 import json
 import os
 import secrets
@@ -17,7 +18,19 @@ TG_TOKEN = os.getenv("TELEGRAM_" + "BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_" + "CHAT_ID")
 INTERACTIVE_ENABLED = os.getenv("TELEGRAM_INTERACTIVE_BOT", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_DRAFT_TTL_HOURS = int(os.getenv("TELEGRAM_REPLY_DRAFT_TTL_HOURS", "24"))
-POST_REPLIES_ENABLED = os.getenv("UFUTURE_POST_REPLIES", "false").strip().lower() in {"1", "true", "yes", "on"}
+POST_REPLIES_ENABLED = (
+    os.getenv("UFUTURE_REPLY_ENABLED", os.getenv("UFUTURE_POST_REPLIES", "false"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+REPLY_CONFIRM_BEFORE_SEND = os.getenv("REPLY_CONFIRM_BEFORE_SEND", "true").strip().lower() in {"1", "true", "yes", "on"}
+REPLY_POST_TIMEOUT_SECONDS = int(os.getenv("REPLY_POST_TIMEOUT_SECONDS", "45"))
+TELEGRAM_ALLOWED_USER_IDS = {
+    item.strip()
+    for item in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
+    if item.strip()
+}
 DROP_PENDING_UPDATES = os.getenv("TELEGRAM_DROP_PENDING_UPDATES", "true").strip().lower() in {"1", "true", "yes", "on"}
 API_BASE = ("https://api.telegram.org/" + "bot" + TG_TOKEN) if TG_TOKEN else ""
 RUNNING = True
@@ -70,6 +83,13 @@ def init_db(conn):
         user_id TEXT NOT NULL,
         topic_id TEXT NOT NULL,
         post_id TEXT,
+        topic_url TEXT,
+        source_action_id TEXT,
+        target_post_id TEXT,
+        target_author TEXT,
+        target_excerpt TEXT,
+        target_posted_time TEXT,
+        target_label TEXT,
         topic_title TEXT,
         draft_text TEXT,
         state TEXT NOT NULL,
@@ -77,11 +97,27 @@ def init_db(conn):
         updated_at TEXT NOT NULL,
         expires_at TEXT NOT NULL
     )''')
+    ensure_column(conn, "telegram_pending_replies", "topic_url", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "source_action_id", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "target_post_id", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "target_author", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "target_excerpt", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "target_posted_time", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "target_label", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "submitted_at", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "result_message", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "dedupe_key", "TEXT")
     conn.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
     conn.commit()
+
+
+def ensure_column(conn, table, column, definition):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def get_state(conn, key, default=None):
@@ -106,6 +142,10 @@ def cleanup_expired(conn):
 
 def is_allowed_chat(chat_id):
     return TG_CHAT_ID and str(chat_id) == str(TG_CHAT_ID)
+
+
+def is_allowed_user(user_id):
+    return not TELEGRAM_ALLOWED_USER_IDS or str(user_id) in TELEGRAM_ALLOWED_USER_IDS
 
 
 def telegram_post(method, data):
@@ -164,16 +204,102 @@ def action_payload(row):
         return {}
 
 
+def truncate_text(value, max_length=180):
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1].rstrip() + "…"
+
+
+def course_display(change):
+    course_name = str(change.get("course_name") or "")
+    course_code = str(change.get("course_code") or "")
+    if course_code and course_name.upper().startswith(course_code.upper()):
+        course_name = course_name[len(course_code):].strip(" -:") or course_name
+    return course_code, course_name
+
+
+def replyable_post(post):
+    return bool(post.get("post_id")) and bool(post.get("replyable", True))
+
+
+def reply_targets(row):
+    payload = action_payload(row)
+    topic = payload.get("topic", {})
+    root_post = topic.get("root_post") or {}
+    posts = topic.get("detail_posts") or topic.get("posts", []) or []
+    targets = []
+    if replyable_post(root_post):
+        targets.append({
+            "key": "root",
+            "label": "Original post",
+            "post": root_post,
+        })
+
+    root_post_id = root_post.get("post_id") if root_post else None
+    reply_index = 1
+    seen = {root_post_id} if root_post_id else set()
+    for post in posts:
+        post_id = post.get("post_id")
+        if not post_id or post_id in seen:
+            continue
+        seen.add(post_id)
+        if not replyable_post(post):
+            continue
+        targets.append({
+            "key": f"reply{reply_index}",
+            "label": f"Reply {reply_index}",
+            "post": post,
+        })
+        reply_index += 1
+        if reply_index > 8:
+            break
+    return targets
+
+
+def find_reply_target(row, target_key):
+    for target in reply_targets(row):
+        if target["key"] == target_key:
+            return target
+    return None
+
+
+def build_target_picker_text(row):
+    payload = action_payload(row)
+    topic = payload.get("topic", {})
+    lines = [
+        f"Choose reply target for <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>:",
+        "",
+    ]
+    targets = reply_targets(row)
+    for target in targets:
+        post = target["post"]
+        lines.append(f"<b>{html_text(target['label'])}</b>")
+        lines.append(html_text(post.get("author") or "Unknown"))
+        if post.get("content_excerpt"):
+            lines.append(html_text(truncate_text(post.get("content_excerpt"), 160)))
+        if post.get("posted_time"):
+            lines.append(html_text(post.get("posted_time")))
+        lines.append("")
+    lines.append("Pick one target, then type your reply.")
+    return "\n".join(lines).strip()
+
+
+def build_target_keyboard(action_id, targets):
+    rows = []
+    for target in targets:
+        rows.append([{"text": target["label"], "callback_data": f"t:{action_id}:{target['key']}"}])
+    rows.append([{"text": "Cancel", "callback_data": "x:reply"}])
+    return {"inline_keyboard": rows}
+
+
 def build_details_text(row):
     payload = action_payload(row)
     change = payload.get("change", {})
     topic = payload.get("topic", {})
     root_post = topic.get("root_post") or {}
     posts = topic.get("detail_posts") or topic.get("posts", []) or []
-    course_name = str(change.get("course_name") or "")
-    course_code = str(change.get("course_code") or "")
-    if course_code and course_name.upper().startswith(course_code.upper()):
-        course_name = course_name[len(course_code):].strip(" -:") or course_name
+    course_code, course_name = course_display(change)
     lines = [
         f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>",
         "",
@@ -210,19 +336,26 @@ def build_details_text(row):
     return "\n".join(lines)
 
 
-def start_reply_draft(conn, row, chat_id, user_id):
+def start_reply_draft(conn, row, chat_id, user_id, action_id, target):
     payload = action_payload(row)
     topic = payload.get("topic", {})
+    post = target["post"]
     now = datetime.now()
     pending_id = secrets.token_urlsafe(8)
     expires_at = now + timedelta(hours=max(1, REPLY_DRAFT_TTL_HOURS))
     conn.execute('''INSERT INTO telegram_pending_replies
-                   (id, chat_id, user_id, topic_id, post_id, topic_title,
-                    draft_text, state, created_at, updated_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (id, chat_id, user_id, topic_id, post_id, topic_url,
+                    source_action_id, target_post_id, target_author, target_excerpt,
+                    target_posted_time, target_label, topic_title, draft_text, state,
+                    created_at, updated_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                  (pending_id, str(chat_id), str(user_id), row["topic_id"] or "",
-                  row["post_id"] or "", topic.get("topic_title") or "Forum topic",
-                  "", "awaiting_text", now.isoformat(), now.isoformat(), expires_at.isoformat()))
+                  row["post_id"] or "", row["topic_url"] or "", action_id,
+                  post.get("post_id") or "", post.get("author") or "Unknown",
+                  truncate_text(post.get("content_excerpt"), 500),
+                  post.get("posted_time") or "", target["label"],
+                  topic.get("topic_title") or "Forum topic", "", "awaiting_text",
+                  now.isoformat(), now.isoformat(), expires_at.isoformat()))
     conn.commit()
     return pending_id, topic.get("topic_title") or "Forum topic"
 
@@ -255,6 +388,28 @@ def update_pending_state(conn, pending_id, state, draft_text=None):
     conn.commit()
 
 
+def update_pending_preview(conn, pending_id, pending, draft_text):
+    dedupe_source = "|".join([
+        pending["topic_id"] or "",
+        pending["target_post_id"] or "",
+        draft_text or "",
+    ])
+    dedupe_key = hashlib.sha256(dedupe_source.encode("utf-8")).hexdigest()
+    conn.execute('''UPDATE telegram_pending_replies
+                    SET state = 'preview', draft_text = ?, dedupe_key = ?, updated_at = ?
+                    WHERE id = ?''',
+                 (draft_text, dedupe_key, datetime.now().isoformat(), pending_id))
+    conn.commit()
+
+
+def update_pending_result(conn, pending_id, state, result_message):
+    conn.execute('''UPDATE telegram_pending_replies
+                    SET state = ?, result_message = ?, updated_at = ?
+                    WHERE id = ?''',
+                 (state, result_message, datetime.now().isoformat(), pending_id))
+    conn.commit()
+
+
 def load_pending(conn, pending_id):
     row = conn.execute("SELECT * FROM telegram_pending_replies WHERE id = ?", (pending_id,)).fetchone()
     if not row:
@@ -280,13 +435,53 @@ def handle_reply_start(conn, callback, action_id):
         answer_callback(callback["id"], error)
         return
     message = callback.get("message") or {}
+    targets = reply_targets(row)
+    if not targets:
+        answer_callback(callback["id"], "No replyable target was captured.")
+        send_message(
+            message["chat"]["id"],
+            "No replyable target was captured for this topic yet. Open the topic in UiTM to reply manually.",
+            reply_to_message_id=message.get("message_id"),
+        )
+        return
+    answer_callback(callback["id"], "Choose reply target.")
+    send_message(
+        message["chat"]["id"],
+        build_target_picker_text(row),
+        reply_markup=build_target_keyboard(action_id, targets),
+        reply_to_message_id=message.get("message_id"),
+    )
+
+
+def handle_reply_target(conn, callback, action_id, target_key):
+    row, error = load_action(conn, action_id, "reply")
+    if error:
+        answer_callback(callback["id"], error)
+        return
+    target = find_reply_target(row, target_key)
+    if not target:
+        answer_callback(callback["id"], "Target expired or unavailable.")
+        return
+    message = callback.get("message") or {}
     user = callback.get("from") or {}
-    pending_id, topic_title = start_reply_draft(conn, row, message["chat"]["id"], user.get("id"))
-    answer_callback(callback["id"], "Reply draft started.")
+    pending_id, topic_title = start_reply_draft(
+        conn,
+        row,
+        message["chat"]["id"],
+        user.get("id"),
+        action_id,
+        target,
+    )
+    answer_callback(callback["id"], "Reply target selected.")
+    post = target["post"]
     send_message(
         message["chat"]["id"],
         "\n".join([
             f"Reply draft for <b>{html_text(topic_title)}</b>",
+            "",
+            f"Target: <b>{html_text(target['label'])}</b>",
+            html_text(post.get("author") or "Unknown"),
+            html_text(truncate_text(post.get("content_excerpt"), 220)),
             "",
             "Type your reply message here.",
             "Send /cancel to stop.",
@@ -297,19 +492,135 @@ def handle_reply_start(conn, callback, action_id):
     )
 
 
+def build_preview_text(row):
+    lines = [
+        f"Preview reply to <b>{html_text(row['topic_title'])}</b>",
+        "",
+        f"Target: <b>{html_text(row['target_label'] or 'Selected post')}</b>",
+        html_text(row["target_author"] or "Unknown"),
+    ]
+    if row["target_excerpt"]:
+        lines.append(html_text(row["target_excerpt"]))
+    if row["target_posted_time"]:
+        lines.append(html_text(row["target_posted_time"]))
+    lines.extend([
+        "",
+        "<b>Your reply</b>",
+        html_text(row["draft_text"]),
+        "",
+    ])
+    if POST_REPLIES_ENABLED:
+        if REPLY_CONFIRM_BEFORE_SEND:
+            lines.append("Confirm before sending to UiTM.")
+        else:
+            lines.append("Reply posting is enabled. Use Send to UiTM to continue.")
+    else:
+        lines.append("UiTM posting is disabled. You can save this as a draft.")
+    return "\n".join(lines)
+
+
+def build_preview_keyboard(pending_id):
+    rows = [[
+        {"text": "Send to UiTM", "callback_data": f"p:{pending_id}"},
+        {"text": "Edit", "callback_data": f"e:{pending_id}"},
+    ]]
+    rows.append([
+        {"text": "Save Draft", "callback_data": f"s:{pending_id}"},
+        {"text": "Cancel", "callback_data": f"c:{pending_id}"},
+    ])
+    return {"inline_keyboard": rows}
+
+
 def handle_save_draft(conn, callback, pending_id):
     row = load_pending(conn, pending_id)
     if not row:
         answer_callback(callback["id"], "Draft expired or not found.")
-        return
-    if POST_REPLIES_ENABLED:
-        answer_callback(callback["id"], "UiTM posting is not implemented in this phase.")
         return
     update_pending_state(conn, pending_id, "saved")
     answer_callback(callback["id"], "Draft saved.")
     send_message(
         callback["message"]["chat"]["id"],
         f"Draft saved for <b>{html_text(row['topic_title'])}</b>. No UiTM post was made.",
+        reply_to_message_id=callback["message"].get("message_id"),
+    )
+
+
+def handle_edit_draft(conn, callback, pending_id):
+    row = load_pending(conn, pending_id)
+    if not row:
+        answer_callback(callback["id"], "Draft expired or not found.")
+        return
+    update_pending_state(conn, pending_id, "awaiting_text")
+    answer_callback(callback["id"], "Edit draft.")
+    send_message(
+        callback["message"]["chat"]["id"],
+        "\n".join([
+            f"Editing reply for <b>{html_text(row['topic_title'])}</b>",
+            "",
+            "Type the replacement reply message.",
+            "Send /cancel to stop.",
+        ]),
+        reply_to_message_id=callback["message"].get("message_id"),
+    )
+
+
+def submit_reply_to_ufuture(_row):
+    _ = REPLY_POST_TIMEOUT_SECONDS
+    return False, (
+        "Live UiTM posting is not implemented yet. "
+        "The bot has the target, draft, and confirmation flow ready, but Phase 2B still needs "
+        "safe discovery of the UiTM reply modal form endpoint and CSRF/session fields."
+    )
+
+
+def handle_send_reply(conn, callback, pending_id):
+    row = load_pending(conn, pending_id)
+    if not row:
+        answer_callback(callback["id"], "Draft expired or not found.")
+        return
+    if row["state"] != "preview":
+        answer_callback(callback["id"], "Draft is not ready to send.")
+        return
+    if not row["draft_text"]:
+        answer_callback(callback["id"], "Draft is empty.")
+        return
+    if row["dedupe_key"]:
+        duplicate = conn.execute('''SELECT id FROM telegram_pending_replies
+                                    WHERE dedupe_key = ?
+                                      AND state = 'posted'
+                                      AND id != ?
+                                    LIMIT 1''',
+                                 (row["dedupe_key"], pending_id)).fetchone()
+        if duplicate:
+            answer_callback(callback["id"], "Duplicate reply blocked.")
+            send_message(
+                callback["message"]["chat"]["id"],
+                "Duplicate reply blocked. This exact reply was already posted for the selected target.",
+                reply_to_message_id=callback["message"].get("message_id"),
+            )
+            return
+    if not POST_REPLIES_ENABLED:
+        answer_callback(callback["id"], "UiTM posting disabled.")
+        send_message(
+            callback["message"]["chat"]["id"],
+            "\n".join([
+                "UiTM posting is disabled by <code>UFUTURE_REPLY_ENABLED=false</code>.",
+                "Your draft is still available. Use Save Draft, Edit, or Cancel.",
+            ]),
+            reply_to_message_id=callback["message"].get("message_id"),
+        )
+        return
+
+    ok, result_message = submit_reply_to_ufuture(row)
+    if ok:
+        update_pending_result(conn, pending_id, "posted", result_message)
+        answer_callback(callback["id"], "Posted to UiTM.")
+    else:
+        update_pending_result(conn, pending_id, "send_failed", result_message)
+        answer_callback(callback["id"], "Posting failed.")
+    send_message(
+        callback["message"]["chat"]["id"],
+        html_text(result_message),
         reply_to_message_id=callback["message"].get("message_id"),
     )
 
@@ -329,9 +640,14 @@ def handle_cancel(conn, callback, pending_id):
 def handle_callback(conn, callback):
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
+    user_id = (callback.get("from") or {}).get("id")
     if not is_allowed_chat(chat_id):
         answer_callback(callback["id"], "Unauthorized chat.")
         print("Ignored callback from unauthorized chat")
+        return
+    if not is_allowed_user(user_id):
+        answer_callback(callback["id"], "Unauthorized user.")
+        print("Ignored callback from unauthorized user")
         return
     data = callback.get("data") or ""
     if ":" not in data:
@@ -342,10 +658,22 @@ def handle_callback(conn, callback):
         handle_details(conn, callback, identifier)
     elif prefix == "r":
         handle_reply_start(conn, callback, identifier)
+    elif prefix == "t":
+        parts = identifier.split(":", 1)
+        if len(parts) != 2:
+            answer_callback(callback["id"], "Invalid target.")
+            return
+        handle_reply_target(conn, callback, parts[0], parts[1])
+    elif prefix == "p":
+        handle_send_reply(conn, callback, identifier)
+    elif prefix == "e":
+        handle_edit_draft(conn, callback, identifier)
     elif prefix == "s":
         handle_save_draft(conn, callback, identifier)
     elif prefix == "c":
         handle_cancel(conn, callback, identifier)
+    elif prefix == "x":
+        answer_callback(callback["id"], "Cancelled.")
     else:
         answer_callback(callback["id"], "Unknown action.")
 
@@ -355,6 +683,9 @@ def handle_message(conn, message):
     user_id = (message.get("from") or {}).get("id")
     if not is_allowed_chat(chat_id):
         print("Ignored message from unauthorized chat")
+        return
+    if not is_allowed_user(user_id):
+        print("Ignored message from unauthorized user")
         return
     text = (message.get("text") or "").strip()
     if not text:
@@ -368,23 +699,12 @@ def handle_message(conn, message):
     pending = latest_pending_reply(conn, chat_id, user_id)
     if not pending:
         return
-    update_pending_state(conn, pending["id"], "preview", text)
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "Save Draft", "callback_data": f"s:{pending['id']}"},
-            {"text": "Cancel", "callback_data": f"c:{pending['id']}"},
-        ]]
-    }
+    update_pending_preview(conn, pending["id"], pending, text)
+    pending = load_pending(conn, pending["id"])
     send_message(
         chat_id,
-        "\n".join([
-            f"Preview reply to <b>{html_text(pending['topic_title'])}</b>:",
-            "",
-            html_text(text),
-            "",
-            "This will only save a draft. UiTM posting is disabled in this phase.",
-        ]),
-        reply_markup=keyboard,
+        build_preview_text(pending),
+        reply_markup=build_preview_keyboard(pending["id"]),
         reply_to_message_id=message.get("message_id"),
     )
 

@@ -168,6 +168,7 @@ def init_db():
         post_id TEXT,
         parent_post_id TEXT,
         post_level INTEGER,
+        replyable INTEGER,
         author TEXT,
         content_excerpt TEXT,
         media_url TEXT,
@@ -180,6 +181,7 @@ def init_db():
     ensure_column(c, "posts", "media_url", "TEXT")
     ensure_column(c, "posts", "media_label", "TEXT")
     ensure_column(c, "posts", "post_level", "INTEGER DEFAULT 0")
+    ensure_column(c, "posts", "replyable", "INTEGER DEFAULT 0")
 
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_actions (
         action_id TEXT PRIMARY KEY,
@@ -204,6 +206,13 @@ def init_db():
         user_id TEXT NOT NULL,
         topic_id TEXT NOT NULL,
         post_id TEXT,
+        topic_url TEXT,
+        source_action_id TEXT,
+        target_post_id TEXT,
+        target_author TEXT,
+        target_excerpt TEXT,
+        target_posted_time TEXT,
+        target_label TEXT,
         topic_title TEXT,
         draft_text TEXT,
         state TEXT NOT NULL,
@@ -211,6 +220,16 @@ def init_db():
         updated_at TEXT NOT NULL,
         expires_at TEXT NOT NULL
     )''')
+    ensure_column(c, "telegram_pending_replies", "topic_url", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "source_action_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_post_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_author", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_excerpt", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_posted_time", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_label", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "submitted_at", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "result_message", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "dedupe_key", "TEXT")
 
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
@@ -618,6 +637,7 @@ def extract_topic_posts(soup, topic_id):
                 "post_id": post_id,
                 "parent_post_id": parent_post_id or "",
                 "post_level": post_level,
+                "replyable": bool(reply_link),
                 "author": author or "Unknown",
                 "content_excerpt": truncate_text(content, DETAIL_EXCERPT_LENGTH),
                 "media_url": media_url,
@@ -759,11 +779,12 @@ def save_to_db(conn, courses, all_results, topic_details=None, post_details=None
 
     for post in post_details or []:
         c.execute('''INSERT OR REPLACE INTO posts
-                    (topic_id, post_id, parent_post_id, post_level, author, content_excerpt,
+                    (topic_id, post_id, parent_post_id, post_level, replyable, author, content_excerpt,
                      media_url, media_label, posted_time, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                  (post['topic_id'], post['post_id'], post.get('parent_post_id', ''),
-                  post.get('post_level', 0), post.get('author', ''),
+                  post.get('post_level', 0), 1 if post.get('replyable') else 0,
+                  post.get('author', ''),
                   post.get('content_excerpt', ''),
                   post.get('media_url', ''), post.get('media_label', ''),
                   post.get('posted_time', ''), now))
@@ -848,7 +869,7 @@ def get_current_post_state(conn, topic_ids=None):
 
     c.execute(f'''SELECT t.course_code, t.week_title, t.topic_id, t.topic_title, t.topic_url,
                          p.post_id, p.parent_post_id, p.author, p.content_excerpt,
-                         p.media_url, p.media_label, p.posted_time, p.post_level, p.id
+                         p.media_url, p.media_label, p.posted_time, p.post_level, p.replyable, p.id
                   FROM posts p
                   JOIN topics t ON p.topic_id = t.topic_id
                   {where_clause}
@@ -870,6 +891,7 @@ def get_current_post_state(conn, topic_ids=None):
             'media_label': row[10],
             'posted_time': row[11],
             'post_level': row[12] or 0,
+            'replyable': bool(row[13]),
         })
     return data
 
