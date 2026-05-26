@@ -244,7 +244,11 @@ def ensure_column(cursor, table, column, definition):
     cursor.execute(f"PRAGMA table_info({table})")
     columns = {row[1] for row in cursor.fetchall()}
     if column not in columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
 
 # ============================================================================
 # SCRAPING FUNCTIONS
