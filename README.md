@@ -162,6 +162,10 @@ services:
       - TELEGRAM_REPLY_DRAFT_TTL_HOURS=24
       - TELEGRAM_BOT_RESTART_SECONDS=5
       - TELEGRAM_DROP_PENDING_UPDATES=true
+      - UFUTURE_REPLY_ENABLED=false
+      - TELEGRAM_ALLOWED_USER_IDS=your_telegram_user_id
+      - REPLY_CONFIRM_BEFORE_SEND=true
+      - REPLY_POST_TIMEOUT_SECONDS=45
       - UFUTURE_POST_REPLIES=false
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
@@ -182,6 +186,7 @@ volumes:
    - `your_password` = your UiTM password
    - `your_bot_token` = Telegram bot token
    - `your_chat_id` = Telegram chat ID
+   - `your_telegram_user_id` = Telegram user ID allowed to use reply actions
 
 4. **Click Deploy**
 
@@ -218,14 +223,18 @@ volumes:
 | `TELEGRAM_REPLY_DRAFT_TTL_HOURS` | How long pending Telegram reply drafts remain valid | `24` |
 | `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
 | `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
-| `UFUTURE_POST_REPLIES` | Reserved for future confirmed UiTM posting; keep disabled in phase 1 | `false` |
+| `UFUTURE_REPLY_ENABLED` | Enable live UiTM reply posting after preview confirmation; keep disabled until posting is verified | `false` |
+| `TELEGRAM_ALLOWED_USER_IDS` | Telegram user IDs allowed to use reply actions, comma-separated for multiple users | `your_telegram_user_id` |
+| `REPLY_CONFIRM_BEFORE_SEND` | Require preview confirmation before any UiTM reply post attempt | `true` |
+| `REPLY_POST_TIMEOUT_SECONDS` | Timeout for a confirmed UiTM reply post attempt | `45` |
+| `UFUTURE_POST_REPLIES` | Legacy live-posting guard; prefer `UFUTURE_REPLY_ENABLED` | `false` |
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
 
 ## Telegram Setup
 
-Topic detail notifications can include inline buttons. In `hybrid` mode, `Details` and `Reply` are Telegram callback buttons handled inside the chat, while `Media` and `Open` remain URL buttons. `Media` appears only when a media or attachment URL is detected. Phase 1 never posts replies to UiTM; reply text is saved as a local Telegram draft only.
+Topic detail notifications can include inline buttons. In `hybrid` mode, `Details` and `Reply` are Telegram callback buttons handled inside the chat, while `Media` and `Open` remain URL buttons. `Media` appears only when a media or attachment URL is detected. Reply target selection, preview, edit, save draft, and cancel run inside Telegram; live UiTM posting remains guarded by `UFUTURE_REPLY_ENABLED=false` until the posting path is verified.
 
 The container runs a small supervisor that starts both the scraper scheduler and the interactive Telegram bot worker. The bot uses Telegram long polling, stores its update offset in SQLite, and only responds to the configured `TELEGRAM_CHAT_ID`.
 
@@ -340,11 +349,13 @@ The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts
 
 ### Interactive Telegram Bot
 - `Details` shows stored topic/reply context inside Telegram.
-- `Reply` starts a Telegram draft flow and previews the message.
-- `Save Draft` stores the draft locally only.
+- `Reply` lets you choose `Original post` or a specific reply, then write a response.
+- `Preview` shows the target and message before any post attempt.
+- `Confirm` is guarded; with the default config it keeps the draft in Telegram and does not post to UiTM.
+- `Save Draft` stores the draft locally only; `Cancel` discards the flow.
 - `Media` opens the detected media/attachment URL instead of downloading it into Telegram.
 - `Open` opens the UiTM topic page.
-- UiTM posting is intentionally disabled while `UFUTURE_POST_REPLIES=false`.
+- UiTM posting is intentionally guarded and disabled by default.
 
 ## Security Notes
 
