@@ -1028,11 +1028,23 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
         for topic in week_topics:
             topic_posts = posts_by_topic.get(topic["topic_id"], [])
             previous_post_ids = last_post_ids_by_topic.get(topic["topic_id"], set())
-            new_posts = [
-                post for post in topic_posts
-                if has_detail_history and post.get("post_id") not in previous_post_ids
-            ]
-            is_new_topic = has_detail_history and topic["topic_id"] not in last_topic_ids
+            has_post_history = bool(previous_post_ids)
+            is_new_topic = (
+                has_detail_history
+                and change.get("new_topics", 0) > 0
+                and topic["topic_id"] not in last_topic_ids
+            )
+            if has_detail_history and has_post_history:
+                new_posts = [
+                    post for post in topic_posts
+                    if post.get("post_id") not in previous_post_ids
+                ]
+            elif is_new_topic:
+                new_posts = topic_posts
+            else:
+                fallback_count = max(1, min(change.get("new_posts", 0), len(topic_posts)))
+                new_posts = topic_posts[-fallback_count:] if topic_posts and fallback_count else []
+            exact_post_diff = has_detail_history and has_post_history
 
             if has_detail_history and not is_new_topic and not new_posts:
                 continue
@@ -1056,7 +1068,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 "detail_posts": latest_posts[-10:],
                 "media_url": media_post.get("media_url", "") if media_post else "",
                 "media_label": media_post.get("media_label", "") if media_post else "",
-                "exact_post_diff": has_detail_history,
+                "exact_post_diff": exact_post_diff,
             })
 
         if not details:

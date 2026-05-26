@@ -163,7 +163,7 @@ services:
       - TELEGRAM_BOT_RESTART_SECONDS=5
       - TELEGRAM_DROP_PENDING_UPDATES=true
       - UFUTURE_REPLY_ENABLED=false
-      - TELEGRAM_ALLOWED_USER_IDS=your_telegram_user_id
+      - TELEGRAM_ALLOWED_USER_IDS=
       - REPLY_CONFIRM_BEFORE_SEND=true
       - REPLY_POST_TIMEOUT_SECONDS=45
       - UFUTURE_POST_REPLIES=false
@@ -186,7 +186,7 @@ volumes:
    - `your_password` = your UiTM password
    - `your_bot_token` = Telegram bot token
    - `your_chat_id` = Telegram chat ID
-   - `your_telegram_user_id` = Telegram user ID allowed to use reply actions
+   - `TELEGRAM_ALLOWED_USER_IDS` can be left blank, or set to your Telegram user ID to lock reply actions to one user
 
 4. **Click Deploy**
 
@@ -224,7 +224,7 @@ volumes:
 | `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
 | `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
 | `UFUTURE_REPLY_ENABLED` | Enable live UiTM reply posting after preview confirmation; keep disabled until posting is verified | `false` |
-| `TELEGRAM_ALLOWED_USER_IDS` | Telegram user IDs allowed to use reply actions, comma-separated for multiple users | `your_telegram_user_id` |
+| `TELEGRAM_ALLOWED_USER_IDS` | Optional Telegram user IDs allowed to use reply actions, comma-separated for multiple users; blank allows the configured chat | blank |
 | `REPLY_CONFIRM_BEFORE_SEND` | Require preview confirmation before any UiTM reply post attempt | `true` |
 | `REPLY_POST_TIMEOUT_SECONDS` | Timeout for a confirmed UiTM reply post attempt | `45` |
 | `UFUTURE_POST_REPLIES` | Legacy live-posting guard; prefer `UFUTURE_REPLY_ENABLED` | `false` |
