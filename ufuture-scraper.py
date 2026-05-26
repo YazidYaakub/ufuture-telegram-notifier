@@ -1097,11 +1097,13 @@ def html_text(value, *, quote=False):
 
 
 def topic_link(topic):
-    title = html_text(topic.get("topic_title") or "Open topic")
-    url = html_text(topic.get("topic_url"), quote=True)
-    if url:
-        return f'<a href="{url}">{title}</a>'
-    return title
+    return html_text(topic.get("topic_title") or "Open topic")
+
+
+def plain_telegram_text(text):
+    text = re.sub(r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre)[^>]*>", "", text)
+    text = re.sub(r'<a\s+href="[^"]*"\s*>(.*?)</a>', r"\1", text)
+    return html.unescape(text)
 
 
 def course_display_name(change):
@@ -1365,20 +1367,52 @@ def send_telegram_notification(changes, conn=None):
     payloads = build_telegram_payloads(changes, conn)
     sent = 0
 
+    def response_description(response):
+        try:
+            data = response.json()
+        except ValueError:
+            return response.text[:200]
+        return str(data.get("description") or data)[:300]
+
+    def post_payload(payload, *, include_markup=True, parse_mode="HTML"):
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": payload["text"] if parse_mode else plain_telegram_text(payload["text"]),
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        if include_markup and payload.get("reply_markup"):
+            data["reply_markup"] = json.dumps(payload["reply_markup"])
+        return requests.post(url, data=data, timeout=10)
+
     try:
         for payload in payloads:
-            data = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": payload["text"],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if payload.get("reply_markup"):
-                data["reply_markup"] = json.dumps(payload["reply_markup"])
-            response = requests.post(url, data=data, timeout=10)
+            response = post_payload(payload)
             if response.status_code != 200:
-                print(f"Failed to send Telegram notification: HTTP {response.status_code}")
-                return False
+                print(
+                    "Telegram send failed with full payload: "
+                    f"HTTP {response.status_code} - {response_description(response)}"
+                )
+                if payload.get("reply_markup"):
+                    response = post_payload(payload, include_markup=False)
+                    if response.status_code == 200:
+                        print("Telegram notification sent without inline buttons after fallback")
+                    else:
+                        print(
+                            "Telegram fallback without buttons failed: "
+                            f"HTTP {response.status_code} - {response_description(response)}"
+                        )
+                if response.status_code != 200:
+                    response = post_payload(payload, include_markup=False, parse_mode=None)
+                    if response.status_code == 200:
+                        print("Telegram notification sent as plain text after fallback")
+                    else:
+                        print(
+                            "Failed to send Telegram notification after fallbacks: "
+                            f"HTTP {response.status_code} - {response_description(response)}"
+                        )
+                        return False
             sent += 1
         print(f"Telegram notification sent ({sent} message part(s))")
         return True
