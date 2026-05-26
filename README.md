@@ -150,6 +150,7 @@ services:
       - TOPIC_DETAIL_LIMIT=20
       - INCLUDE_REPLY_EXCERPTS=true
       - REPLY_EXCERPT_LENGTH=160
+      - DETAIL_EXCERPT_LENGTH=700
       - TELEGRAM_MAX_TOPICS_PER_MESSAGE=8
       - TELEGRAM_INLINE_BUTTONS=true
       - TELEGRAM_DEDUP_REPLIES=true
@@ -205,6 +206,7 @@ volumes:
 | `TOPIC_DETAIL_LIMIT` | Maximum topic detail pages fetched per scraper run | `20` |
 | `INCLUDE_REPLY_EXCERPTS` | Include short reply excerpts in Telegram notifications | `true` |
 | `REPLY_EXCERPT_LENGTH` | Maximum stored/sent reply excerpt length | `160` |
+| `DETAIL_EXCERPT_LENGTH` | Maximum stored excerpt length used by interactive Details views | `700` |
 | `TELEGRAM_MAX_TOPICS_PER_MESSAGE` | Maximum topic detail blocks included per changed week | `8` |
 | `TELEGRAM_INLINE_BUTTONS` | Add Telegram inline URL buttons for changed topics | `true` |
 | `TELEGRAM_DEDUP_REPLIES` | Compact repeated identical reply excerpts with a multiplier | `true` |

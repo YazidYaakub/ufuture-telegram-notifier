@@ -49,6 +49,7 @@ SCRAPE_TOPIC_DETAILS = os.getenv("SCRAPE_TOPIC_DETAILS", "true").strip().lower()
 TOPIC_DETAIL_LIMIT = int(os.getenv("TOPIC_DETAIL_LIMIT", "20"))
 INCLUDE_REPLY_EXCERPTS = os.getenv("INCLUDE_REPLY_EXCERPTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_EXCERPT_LENGTH = int(os.getenv("REPLY_EXCERPT_LENGTH", "160"))
+DETAIL_EXCERPT_LENGTH = int(os.getenv("DETAIL_EXCERPT_LENGTH", "700"))
 TELEGRAM_MAX_TOPICS_PER_MESSAGE = int(os.getenv("TELEGRAM_MAX_TOPICS_PER_MESSAGE", "8"))
 TELEGRAM_INLINE_BUTTONS = os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_DEDUP_REPLIES = os.getenv("TELEGRAM_DEDUP_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -166,6 +167,7 @@ def init_db():
         topic_id TEXT,
         post_id TEXT,
         parent_post_id TEXT,
+        post_level INTEGER,
         author TEXT,
         content_excerpt TEXT,
         media_url TEXT,
@@ -177,6 +179,7 @@ def init_db():
 
     ensure_column(c, "posts", "media_url", "TEXT")
     ensure_column(c, "posts", "media_label", "TEXT")
+    ensure_column(c, "posts", "post_level", "INTEGER DEFAULT 0")
 
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_actions (
         action_id TEXT PRIMARY KEY,
@@ -518,6 +521,9 @@ def extract_post_author(body, reply_div):
 
 
 def extract_posted_time(actions):
+    time_el = actions.select_one(".timehover[title]") if actions else None
+    if time_el and time_el.get("title"):
+        return time_el.get("title").strip()
     actions_text = normalize_text(actions)
     return first_regex(actions_text, r"Posted\s+(.+?)(?:\s+Reply|$)")
 
@@ -586,7 +592,7 @@ def extract_topic_posts(soup, topic_id):
     posts = []
     seen = set()
 
-    def parse_media(media, parent_post_id=None):
+    def parse_media(media, parent_post_id=None, post_level=0):
         body = direct_media_body(media)
         if not body:
             return
@@ -611,8 +617,9 @@ def extract_topic_posts(soup, topic_id):
                 "topic_id": topic_id,
                 "post_id": post_id,
                 "parent_post_id": parent_post_id or "",
+                "post_level": post_level,
                 "author": author or "Unknown",
-                "content_excerpt": truncate_text(content),
+                "content_excerpt": truncate_text(content, DETAIL_EXCERPT_LENGTH),
                 "media_url": media_url,
                 "media_label": media_label,
                 "posted_time": posted_time,
@@ -620,7 +627,7 @@ def extract_topic_posts(soup, topic_id):
             seen.add(post_id)
 
         for nested in body.find_all("div", class_=class_has_media, recursive=False):
-            parse_media(nested, post_id)
+            parse_media(nested, post_id, post_level + 1)
 
     for media in card.find_all("div", class_=class_has_media):
         if media.find_parent("div", class_=class_has_media):
@@ -752,11 +759,12 @@ def save_to_db(conn, courses, all_results, topic_details=None, post_details=None
 
     for post in post_details or []:
         c.execute('''INSERT OR REPLACE INTO posts
-                    (topic_id, post_id, parent_post_id, author, content_excerpt,
+                    (topic_id, post_id, parent_post_id, post_level, author, content_excerpt,
                      media_url, media_label, posted_time, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                  (post['topic_id'], post['post_id'], post.get('parent_post_id', ''),
-                  post.get('author', ''), post.get('content_excerpt', ''),
+                  post.get('post_level', 0), post.get('author', ''),
+                  post.get('content_excerpt', ''),
                   post.get('media_url', ''), post.get('media_label', ''),
                   post.get('posted_time', ''), now))
     
@@ -840,11 +848,11 @@ def get_current_post_state(conn, topic_ids=None):
 
     c.execute(f'''SELECT t.course_code, t.week_title, t.topic_id, t.topic_title, t.topic_url,
                          p.post_id, p.parent_post_id, p.author, p.content_excerpt,
-                         p.media_url, p.media_label, p.posted_time, p.id
+                         p.media_url, p.media_label, p.posted_time, p.post_level, p.id
                   FROM posts p
                   JOIN topics t ON p.topic_id = t.topic_id
                   {where_clause}
-                  ORDER BY t.course_code, t.week_title, t.topic_title, p.id''', params)
+                  ORDER BY t.course_code, t.week_title, t.topic_title, p.post_level, p.id''', params)
 
     data = []
     for row in c.fetchall():
@@ -861,6 +869,7 @@ def get_current_post_state(conn, topic_ids=None):
             'media_url': row[9],
             'media_label': row[10],
             'posted_time': row[11],
+            'post_level': row[12] or 0,
         })
     return data
 
@@ -961,6 +970,13 @@ def group_by(items, key_func):
     return grouped
 
 
+def topic_root_post(topic_posts):
+    for post in topic_posts:
+        if not post.get("parent_post_id") or post.get("post_level") == 0:
+            return post
+    return topic_posts[0] if topic_posts else None
+
+
 def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
     if not changes or not current_topics:
         return changes
@@ -996,6 +1012,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 continue
 
             latest_posts = new_posts or topic_posts[-2:]
+            root_post = topic_root_post(topic_posts)
             media_post = next((post for post in topic_posts if post.get("media_url")), None)
             details.append({
                 "topic_id": topic["topic_id"],
@@ -1009,6 +1026,8 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 "new_topic": is_new_topic,
                 "new_posts": len(new_posts),
                 "posts": latest_posts[-3:],
+                "root_post": root_post,
+                "detail_posts": latest_posts[-10:],
                 "media_url": media_post.get("media_url", "") if media_post else "",
                 "media_label": media_post.get("media_label", "") if media_post else "",
                 "exact_post_diff": has_detail_history,
@@ -1017,6 +1036,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
         if not details:
             for topic in week_topics[:topic_limit]:
                 topic_posts = posts_by_topic.get(topic["topic_id"], [])
+                root_post = topic_root_post(topic_posts)
                 media_post = next((post for post in topic_posts if post.get("media_url")), None)
                 details.append({
                     "topic_id": topic["topic_id"],
@@ -1030,6 +1050,8 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                     "new_topic": False,
                     "new_posts": 0,
                     "posts": topic_posts[-2:],
+                    "root_post": root_post,
+                    "detail_posts": topic_posts[-10:],
                     "media_url": media_post.get("media_url", "") if media_post else "",
                     "media_label": media_post.get("media_label", "") if media_post else "",
                     "exact_post_diff": has_detail_history,
@@ -1213,7 +1235,7 @@ def build_change_block(change, *, number_topics=False):
             for post in grouped_posts(topic.get("posts", [])):
                 author = html_text(short_display_name(post.get("author") or "Unknown"))
                 posted_time = html_text(post.get("posted_time") or "-")
-                excerpt = html_text(post.get("content_excerpt") or "")
+                excerpt = html_text(truncate_text(post.get("content_excerpt") or "", REPLY_EXCERPT_LENGTH))
                 if excerpt:
                     suffix = f" ×{post['count']}" if post.get("count", 1) > 1 else ""
                     lines.append(f"↳ {author}: {excerpt}{suffix}")
