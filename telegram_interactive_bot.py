@@ -168,26 +168,42 @@ def build_details_text(row):
     payload = action_payload(row)
     change = payload.get("change", {})
     topic = payload.get("topic", {})
-    posts = topic.get("posts", []) or []
+    root_post = topic.get("root_post") or {}
+    posts = topic.get("detail_posts") or topic.get("posts", []) or []
+    course_name = str(change.get("course_name") or "")
+    course_code = str(change.get("course_code") or "")
+    if course_code and course_name.upper().startswith(course_code.upper()):
+        course_name = course_name[len(course_code):].strip(" -:") or course_name
     lines = [
         f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>",
         "",
-        f"Course: {html_text(change.get('course_code'))} - {html_text(change.get('course_name'))}",
+        f"Course: {html_text(course_code)} - {html_text(course_name)}",
         f"Week: {html_text(change.get('week'))}",
     ]
     if topic.get("replies") is not None:
         lines.append(f"Total replies: {html_text(topic.get('replies'))}")
     if topic.get("last_activity"):
         lines.append(f"Last activity: {html_text(topic.get('last_activity'))}")
-    if posts:
-        lines.extend(["", "<b>Latest replies</b>"])
-        for index, post in enumerate(posts[:10], start=1):
+
+    if root_post:
+        lines.extend(["", "<b>Original post</b>"])
+        lines.append(html_text(root_post.get("author") or "Unknown"))
+        if root_post.get("content_excerpt"):
+            lines.append(html_text(root_post.get("content_excerpt")))
+        if root_post.get("posted_time"):
+            lines.append(html_text(root_post.get("posted_time")))
+
+    root_post_id = root_post.get("post_id") if root_post else None
+    reply_posts = [post for post in posts if post.get("post_id") != root_post_id]
+    if reply_posts:
+        lines.extend(["", "<b>New/latest replies</b>"])
+        for index, post in enumerate(reply_posts[:10], start=1):
             lines.append(f"{index}. {html_text(post.get('author') or 'Unknown')}")
             if post.get("content_excerpt"):
                 lines.append(f"   {html_text(post.get('content_excerpt'))}")
             if post.get("posted_time"):
                 lines.append(f"   {html_text(post.get('posted_time'))}")
-    else:
+    elif not root_post:
         lines.extend(["", "No stored reply excerpt is available for this topic."])
     if row["topic_url"]:
         lines.extend(["", f"Open topic: {html_text(row['topic_url'])}"])
