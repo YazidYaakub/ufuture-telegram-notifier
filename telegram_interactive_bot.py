@@ -26,10 +26,11 @@ POST_REPLIES_ENABLED = (
 )
 REPLY_CONFIRM_BEFORE_SEND = os.getenv("REPLY_CONFIRM_BEFORE_SEND", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_POST_TIMEOUT_SECONDS = int(os.getenv("REPLY_POST_TIMEOUT_SECONDS", "45"))
+TELEGRAM_ALLOWED_USER_IDS_PLACEHOLDERS = {"your_telegram_user_id", "telegram_user_id", "none", "null"}
 TELEGRAM_ALLOWED_USER_IDS = {
-    item.strip()
-    for item in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
-    if item.strip()
+    item
+    for item in (value.strip() for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(","))
+    if item and item.lower() not in TELEGRAM_ALLOWED_USER_IDS_PLACEHOLDERS
 }
 DROP_PENDING_UPDATES = os.getenv("TELEGRAM_DROP_PENDING_UPDATES", "true").strip().lower() in {"1", "true", "yes", "on"}
 API_BASE = ("https://api.telegram.org/" + "bot" + TG_TOKEN) if TG_TOKEN else ""
