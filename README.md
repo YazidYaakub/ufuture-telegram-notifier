@@ -156,6 +156,7 @@ services:
       - TELEGRAM_DEDUP_REPLIES=true
       - TELEGRAM_SHORT_NAMES=true
       - TELEGRAM_MEDIA_BUTTONS=true
+      - TELEGRAM_REPLY_TARGET_LIMIT=8
       - TELEGRAM_INTERACTIVE_BOT=true
       - TELEGRAM_BUTTON_MODE=hybrid
       - TELEGRAM_ACTION_TTL_HOURS=72
@@ -217,6 +218,7 @@ volumes:
 | `TELEGRAM_DEDUP_REPLIES` | Compact repeated identical reply excerpts with a multiplier | `true` |
 | `TELEGRAM_SHORT_NAMES` | Shorten long display names in the main notification | `true` |
 | `TELEGRAM_MEDIA_BUTTONS` | Show a media button when a media/attachment URL is detected | `true` |
+| `TELEGRAM_REPLY_TARGET_LIMIT` | Maximum recent replyable posts offered as Telegram reply targets, excluding the original post | `8` |
 | `TELEGRAM_INTERACTIVE_BOT` | Run the long-polling interactive Telegram bot worker | `true` |
 | `TELEGRAM_BUTTON_MODE` | Button behavior; `hybrid` uses callback buttons for Details/Reply and URL buttons for Media/Open | `hybrid` |
 | `TELEGRAM_ACTION_TTL_HOURS` | How long notification callback actions remain valid | `72` |
@@ -349,7 +351,7 @@ The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts
 
 ### Interactive Telegram Bot
 - `Details` shows stored topic/reply context inside Telegram.
-- `Reply` lets you choose `Original post` or a specific reply, then write a response.
+- `Reply` lets you choose `Original post` or a recent replyable reply, then write a response.
 - `Preview` shows the target and message before any post attempt.
 - `Confirm` is guarded; with the default config it keeps the draft in Telegram and does not post to UiTM.
 - `Save Draft` stores the draft locally only; `Cancel` discards the flow.
