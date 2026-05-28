@@ -228,11 +228,15 @@ def replyable_post(post):
     return bool(post.get("post_id")) and bool(post.get("replyable", True))
 
 
+def target_author_label(author):
+    return truncate_text(author or "Unknown", 24)
+
+
 def reply_targets(row):
     payload = action_payload(row)
     topic = payload.get("topic", {})
     root_post = topic.get("root_post") or {}
-    posts = topic.get("detail_posts") or topic.get("posts", []) or []
+    posts = topic.get("reply_targets") or topic.get("detail_posts") or topic.get("posts", []) or []
     targets = []
     if replyable_post(root_post):
         targets.append({
@@ -253,7 +257,7 @@ def reply_targets(row):
             continue
         targets.append({
             "key": f"reply{reply_index}",
-            "label": f"Reply {reply_index}",
+            "label": f"Reply {reply_index}: {target_author_label(post.get('author'))}",
             "post": post,
         })
         reply_index += 1

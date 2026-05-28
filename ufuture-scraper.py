@@ -55,6 +55,7 @@ TELEGRAM_INLINE_BUTTONS = os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().l
 TELEGRAM_DEDUP_REPLIES = os.getenv("TELEGRAM_DEDUP_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_SHORT_NAMES = os.getenv("TELEGRAM_SHORT_NAMES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_MEDIA_BUTTONS = os.getenv("TELEGRAM_MEDIA_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_REPLY_TARGET_LIMIT = int(os.getenv("TELEGRAM_REPLY_TARGET_LIMIT", "8"))
 TELEGRAM_BUTTON_MODE = os.getenv("TELEGRAM_BUTTON_MODE", "hybrid").strip().lower()
 TELEGRAM_ACTION_TTL_HOURS = int(os.getenv("TELEGRAM_ACTION_TTL_HOURS", "72"))
 TELEGRAM_REPLY_DRAFT_TTL_HOURS = int(os.getenv("TELEGRAM_REPLY_DRAFT_TTL_HOURS", "24"))
@@ -1003,6 +1004,20 @@ def topic_root_post(topic_posts):
     return topic_posts[0] if topic_posts else None
 
 
+def topic_reply_targets(topic_posts, root_post):
+    root_post_id = root_post.get("post_id") if root_post else ""
+    replyable_posts = [
+        post for post in topic_posts
+        if post.get("post_id")
+        and post.get("post_id") != root_post_id
+        and post.get("replyable")
+    ]
+    target_limit = max(0, TELEGRAM_REPLY_TARGET_LIMIT)
+    if not target_limit:
+        return []
+    return replyable_posts[-target_limit:]
+
+
 def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
     if not changes or not current_topics:
         return changes
@@ -1066,6 +1081,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                 "posts": latest_posts[-3:],
                 "root_post": root_post,
                 "detail_posts": latest_posts[-10:],
+                "reply_targets": topic_reply_targets(topic_posts, root_post),
                 "media_url": media_post.get("media_url", "") if media_post else "",
                 "media_label": media_post.get("media_label", "") if media_post else "",
                 "exact_post_diff": exact_post_diff,
@@ -1090,6 +1106,7 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
                     "posts": topic_posts[-2:],
                     "root_post": root_post,
                     "detail_posts": topic_posts[-10:],
+                    "reply_targets": topic_reply_targets(topic_posts, root_post),
                     "media_url": media_post.get("media_url", "") if media_post else "",
                     "media_label": media_post.get("media_label", "") if media_post else "",
                     "exact_post_diff": has_detail_history,
