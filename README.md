@@ -405,6 +405,8 @@ The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts
 
 Files already sent to Telegram are re-sent instantly from their Telegram `file_id`. Other files are downloaded by the bot with its own UiTM login, in memory only, and sent; nothing is written to disk. Topic cards show a `📎 Files` button when the topic has attachments.
 
+Courses that are no longer on your UiTM dashboard (for example last semester's) are deleted from the database, with their weeks, topics, posts and queued files, at the end of each successful scrape. A course whose page fails to load in a run is kept; a failed run deletes nothing.
+
 The first run after upgrading re-reads every topic page once (up to `TOPIC_DETAIL_LIMIT`) to fill in attachments and your own posts for data stored by older versions. No notifications are sent for this refresh.
 
 ### Interactive Telegram Bot
