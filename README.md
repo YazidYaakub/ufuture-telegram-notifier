@@ -170,6 +170,9 @@ services:
       - UFUTURE_POST_REPLIES=false
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
+      - SCRAPER_ALERT_AFTER=3
+      - TOPIC_DETAIL_MODE=changed
+      - TELEGRAM_SILENT_CLASSMATE_REPLIES=true
     
     volumes:
       - ufuture-data:/app/data
@@ -233,6 +236,10 @@ volumes:
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
+| `SCRAPER_ALERT_AFTER` | Send one Telegram alert after N consecutive failed runs, and a recovery message when it works again; `0` disables | `3` |
+| `TOPIC_DETAIL_MODE` | `changed` fetches topic pages only for weeks whose counts changed (plus a full fetch when the database has no topics yet); `all` fetches up to `TOPIC_DETAIL_LIMIT` topics every run | `changed` |
+| `TELEGRAM_SILENT_CLASSMATE_REPLIES` | Send notifications silently when they only contain classmates' replies; new topics, posts by the topic creator, and replies to your posts still notify with sound | `true` |
+| `DRY_RUN` | Print Telegram messages and alerts instead of sending them; use with temporary `DB_PATH`/`SNAPSHOT_PATH` | `false` |
 
 ## Telegram Setup
 
@@ -325,6 +332,8 @@ author          TEXT
 content_excerpt TEXT
 media_url       TEXT
 media_label     TEXT
+attachments_json TEXT     -- all attachments in the post: [{"url", "label"}]
+is_own          INTEGER   -- 1 when the post belongs to the logged-in user
 posted_time     TEXT
 last_updated    TIMESTAMP
 UNIQUE(topic_id, post_id)
@@ -342,6 +351,10 @@ UNIQUE(topic_id, post_id)
 - Scrapes forums again
 - Compares with previous state
 - Detects: new posts, new topics, latest user activity
+- Compares against every post id already stored in SQLite, so new replies are exact even when there are more topics than `TOPIC_DETAIL_LIMIT`
+- Orders posts by posted time (UiTM renders nested replies out of time order)
+- Skips your own posts; a change made only of your own posts sends nothing
+- Tags replies to your posts with `↩️ you` and posts by the topic creator with `📌`, lists attachment names with `📎`
 - Prioritizes changed weeks before spending the topic detail limit, then adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
@@ -409,7 +422,7 @@ If you use Technitium DNS, check its query logs, allowlist the UiTM domain if bl
 **Solution:** Verify bot token and chat ID are correct
 
 ### Container says scraper completed with non-zero code
-**Solution:** Read the scraper log immediately above that line. Exit code `75` means a temporary network or DNS failure. Exit code `2` means required configuration is missing.
+**Solution:** Read the scraper log immediately above that line. Exit code `75` means a temporary network or DNS failure. Exit code `3` means UiTM rejected the login (the scraper does not retry, to avoid locking the account). Exit code `2` means required configuration is missing.
 
 ### No database file created
 **Solution:** Check `DB_PATH` in environment variables is correct
