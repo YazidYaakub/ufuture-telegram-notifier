@@ -69,6 +69,7 @@ TELEGRAM_SEND_ATTACHMENTS = os.getenv("TELEGRAM_SEND_ATTACHMENTS", "true").strip
 ATTACHMENT_MAX_MB = float(os.getenv("ATTACHMENT_MAX_MB", "20"))
 ATTACHMENT_MAX_PER_RUN = int(os.getenv("ATTACHMENT_MAX_PER_RUN", "5"))
 ATTACHMENT_MAX_ATTEMPTS = 3
+TELEGRAM_LAYOUT = os.getenv("TELEGRAM_LAYOUT", "digest").strip().lower()
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -250,6 +251,17 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
         value TEXT
+    )''')
+
+    # Notifications as sent, so the interactive bot can restore them after
+    # editing a message into a topic card.
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_messages (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reply_markup_json TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
     )''')
 
     # Attachments waiting to be relayed to Telegram. Files are never stored;
@@ -667,6 +679,9 @@ def extract_topic_posts(soup, topic_id):
         if author and content.startswith(author):
             content = content[len(author):].strip()
         content = content.replace("read more", "").strip()
+        for attachment_list in (reply_div.select("ul.attachUL") if reply_div else []):
+            # Attachments are listed separately; keep them out of the post text.
+            content = content.replace(normalize_text(attachment_list), "").strip()
         posted_time = extract_posted_time(actions)
 
         reply_link = actions.select_one('a.open-DialogReply[data-id]') if actions else None
@@ -1149,6 +1164,8 @@ def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_pos
         "replied_to_me": sum(1 for post in new_posts if post.get("to_me")),
         "important": important,
         "posts": (summary_posts or display_posts)[-3:],
+        "new_post_items": new_posts[-20:],
+        "latest_post": next((post for post in reversed(topic_posts) if not post.get("is_own")), None),
         "root_post": root_post,
         "detail_posts": display_posts[-10:],
         "reply_targets": topic_reply_targets(topic_posts, root_post),
@@ -1542,13 +1559,284 @@ def build_telegram_messages(changes):
     return [payload["text"] for payload in build_telegram_payloads(changes)]
 
 
+# ---------------------------------------------------------------------------
+# Digest layout: one message with sound per important topic, plus one silent
+# summary of classmates' replies per run.
+# ---------------------------------------------------------------------------
+
+NAME_PREFIXES = {
+    "MUHAMMAD", "MUHAMAD", "MOHAMAD", "MOHAMMAD", "MOHAMED", "MOHD", "MUHD", "MOHD.",
+    "NUR", "NURUL", "NOR", "NOOR", "SITI", "ABDUL", "ABD", "ABD.", "WAN", "NIK", "MEGAT", "TENGKU",
+}
+NAME_TITLES = {
+    "DR": "Dr.", "PROF": "Prof.", "PROFESOR": "Prof.", "PROFESSOR": "Prof.", "MADYA": "Madya",
+    "ASSOC": "Assoc.", "PM": "PM", "TS": None, "IR": None,
+}
+NAME_STOP_WORDS = {"BIN", "BINTI", "BT", "BT.", "B", "B.", "A/L", "A/P"}
+
+
+def name_case(word):
+    return "-".join(part[:1].upper() + part[1:].lower() for part in word.split("-"))
+
+
+def short_person(name):
+    """'PROFESOR MADYA TS. DR. NORIZAN BINTI ...' -> 'Prof. Madya Dr. Norizan'; 'NUR HASNI MOHAMAD' -> 'Hasni'."""
+    words = [word for word in re.sub(r"\s+", " ", str(name or "")).strip().split(" ") if word]
+    if not words:
+        return "Unknown"
+    titles = []
+    while words and words[0].upper().rstrip(".") in NAME_TITLES:
+        title = NAME_TITLES[words.pop(0).upper().rstrip(".")]
+        if title:  # Ts./Ir. are dropped to keep names short
+            titles.append(title)
+    # The given name is everything before "bin"/"binti".
+    stop = next((index for index, word in enumerate(words) if word.upper() in NAME_STOP_WORDS), len(words))
+    given = words[:stop] or words
+    if titles:
+        return " ".join(titles + [name_case(word) for word in given[:2]])
+    personal = [word for word in given if word.upper() not in NAME_PREFIXES]
+    return name_case((personal or given)[0])
+
+
+def short_week(week_title):
+    match = re.search(r"week\s*(\d+)", str(week_title or ""), re.IGNORECASE)
+    return f"W{match.group(1)}" if match else truncate_text(week_title or "", 40)
+
+
+def clock_time(moment):
+    return moment.strftime("%I:%M %p").lstrip("0")
+
+
+def relative_time(value, now=None):
+    moment = parse_posted_time(value)
+    if not moment:
+        return str(value or "")
+    now = now or datetime.now()
+    days = (now.date() - moment.date()).days
+    if days == 0:
+        return f"today {clock_time(moment)}"
+    if days == 1:
+        return f"yesterday {clock_time(moment)}"
+    if 1 < days < 7:
+        return f"{moment.strftime('%a')} {clock_time(moment)}"
+    return f"{moment.day} {moment.strftime('%b')}"
+
+
+def absolute_time(value):
+    """For stored views (topic card) that may be read days later."""
+    moment = parse_posted_time(value)
+    if not moment:
+        return str(value or "")
+    return f"{moment.strftime('%a')} {moment.day} {moment.strftime('%b')}, {clock_time(moment)}"
+
+
+def featured_posts(topic):
+    """Posts worth showing in an important message: original post, creator posts, replies to me."""
+    new_posts = topic.get("new_post_items") or []
+    featured = []
+    if topic.get("new_topic") and topic.get("root_post"):
+        featured.append(topic["root_post"])
+    featured.extend(
+        post for post in new_posts
+        if (post.get("by_creator") or post.get("to_me"))
+        and post.get("post_id") not in {item.get("post_id") for item in featured}
+    )
+    if not featured:
+        featured = new_posts[-2:] or (topic.get("posts") or [])[-2:]
+    return featured[:3]
+
+
+def post_lines(post, *, excerpt_length=400, when=relative_time):
+    marker = "📌 " if post.get("by_creator") else ""
+    who = html_text(short_person(post.get("author")))
+    action = " replied to you" if post.get("to_me") else ""
+    lines = [f"{marker}<b>{who}</b>{action} · {html_text(when(post.get('posted_time')))}"]
+    excerpt = truncate_text(post.get("content_excerpt") or "", excerpt_length)
+    if excerpt:
+        lines.append(html_text(excerpt))
+    for attachment in (post.get("attachments") or [])[:5]:
+        lines.append(f"📎 {html_text(attachment.get('label') or 'Attachment')}")
+    return lines
+
+
+def topic_heading(change, topic):
+    new = "🆕 " if topic.get("new_topic") else ""
+    return (
+        f"📚 <b>{html_text(change.get('course_code'))}</b> · {html_text(short_week(change.get('week')))}"
+        f" · {new}<b>{html_text(topic.get('topic_title') or 'Topic')}</b>"
+    )
+
+
+def build_important_text(change, topic):
+    lines = [topic_heading(change, topic)]
+    featured = featured_posts(topic)
+    for index, post in enumerate(featured):
+        if index:
+            lines.append("")
+        lines.extend(post_lines(post))
+    shown = {post.get("post_id") for post in featured}
+    others = [post for post in topic.get("new_post_items") or [] if post.get("post_id") not in shown]
+    if others:
+        names = list(dict.fromkeys(short_person(post.get("author")) for post in others))
+        more = f" +{len(names) - 3}" if len(names) > 3 else ""
+        lines.append("")
+        lines.append(
+            f"💬 +{format_count(len(others), 'other new reply', 'other new replies')}"
+            f" ({html_text(', '.join(names[:3]))}{more})"
+        )
+    return "\n".join(lines)[:3900]
+
+
+def build_topic_card_text(change, topic):
+    """Stored with the topic action; uses absolute times since it may be opened days later."""
+    lines = [
+        f"🧵 <b>{html_text(topic.get('topic_title') or 'Topic')}</b>",
+        f"{html_text(change.get('course_code'))} · {html_text(short_week(change.get('week')))}"
+        f" · {html_text(course_display_name(change))}",
+    ]
+    root = topic.get("root_post")
+    if root:
+        lines.append("")
+        lines.extend(post_lines(root, excerpt_length=300, when=absolute_time))
+    latest = topic.get("latest_post")
+    reply_count = format_count(topic.get("replies") or 0, "reply", "replies")
+    lines.append("")
+    if latest and (not root or latest.get("post_id") != root.get("post_id")):
+        lines.append(
+            f"💬 {reply_count} · latest: {html_text(short_person(latest.get('author')))},"
+            f" {html_text(absolute_time(latest.get('posted_time')))}"
+        )
+    else:
+        lines.append(f"💬 {reply_count}")
+    return "\n".join(lines)[:3900]
+
+
+def classmate_summary_line(topic):
+    posts = [post for post in topic.get("new_post_items") or [] if not post.get("is_own")]
+    names = list(dict.fromkeys(short_person(post.get("author")) for post in posts))
+    if len(posts) == 1:
+        excerpt = truncate_text(posts[0].get("content_excerpt") or "", 80)
+        return f"{html_text(names[0])}: \"{html_text(excerpt)}\""
+    more = f" +{len(names) - 4}" if len(names) > 4 else ""
+    return html_text(", ".join(names[:4])) + more
+
+
+def build_digest_text(items, total_topics):
+    total_posts = sum(topic.get("new_posts") or 0 for _, topic in items)
+    lines = [f"💬 <b>Classmate replies</b> · {total_posts}"]
+    for index, (change, topic) in enumerate(items, start=1):
+        lines.append(
+            f"{index}. {html_text(change.get('course_code'))} {html_text(short_week(change.get('week')))}"
+            f" · <b>{html_text(topic.get('topic_title') or 'Topic')}</b>:"
+            f" {format_count(topic.get('new_posts') or 0, 'new', 'new')}"
+        )
+        lines.append(f"   {classmate_summary_line(topic)}")
+    if total_topics > len(items):
+        lines.append(f"…and {total_topics - len(items)} more topic(s)")
+    return "\n".join(lines)[:3900]
+
+
+def topic_button(conn, change, topic, label):
+    if not TELEGRAM_INLINE_BUTTONS or not topic.get("topic_url"):
+        return None
+    if callback_buttons_enabled(conn):
+        card_topic = dict(topic, card_text=build_topic_card_text(change, topic))
+        action_id = create_telegram_action(conn, "topic", change, card_topic)
+        return {"text": label, "callback_data": f"o:{action_id}"}
+    return {"text": label, "url": topic["topic_url"]}
+
+
+def week_fallback_text(change):
+    lines = [
+        f"📚 <b>{html_text(change.get('course_code'))}</b> · {html_text(short_week(change.get('week')))}",
+    ]
+    counts = []
+    if change.get("new_topics"):
+        counts.append(f"🆕 {format_count(change['new_topics'], 'new topic')}")
+    if change.get("new_posts"):
+        counts.append(f"💬 {format_count(change['new_posts'], 'new post')}")
+    counts.append(f"latest: {html_text(short_person(change.get('latest_user')))}, {html_text(change.get('latest_time') or '')}")
+    lines.append(" · ".join(counts))
+    return "\n".join(lines)
+
+
+def build_digest_payloads(changes, conn=None):
+    important, chatter = [], []
+    payloads = []
+    for change_index, change in enumerate(changes):
+        topics = change.get("topic_details") or []
+        if not topics:
+            markup = None
+            if TELEGRAM_INLINE_BUTTONS and change.get("week_link"):
+                markup = {"inline_keyboard": [[{"text": "🌐 Open week", "url": change["week_link"]}]]}
+            payloads.append({
+                "text": week_fallback_text(change), "reply_markup": markup,
+                "disable_notification": False, "change_indexes": [change_index], "targets": [],
+            })
+            continue
+        for topic_index, topic in enumerate(topics):
+            item = (change_index, topic_index)
+            (important if topic.get("important") else chatter).append(item)
+
+    for change_index, topic_index in important:
+        change = changes[change_index]
+        topic = change["topic_details"][topic_index]
+        button = topic_button(conn, change, topic, f"{truncate_text(topic.get('topic_title') or 'Topic', 40)} ▸")
+        payloads.append({
+            "text": build_important_text(change, topic),
+            "reply_markup": {"inline_keyboard": [[button]]} if button else None,
+            "disable_notification": False,
+            "change_indexes": [change_index],
+            "targets": [(change_index, topic_index)],
+            "silent_topics": False,
+        })
+
+    if chatter:
+        shown = chatter[:max(1, TELEGRAM_MAX_TOPICS_PER_MESSAGE)]
+        items = [(changes[ci], changes[ci]["topic_details"][ti]) for ci, ti in shown]
+        buttons = [
+            topic_button(conn, change, topic, f"{index}. {truncate_text(topic.get('topic_title') or 'Topic', 24)} ▸")
+            for index, (change, topic) in enumerate(items, start=1)
+        ]
+        buttons = [button for button in buttons if button]
+        silent = TELEGRAM_SILENT_CLASSMATE_REPLIES
+        payloads.append({
+            "text": build_digest_text(items, len(chatter)),
+            "reply_markup": {"inline_keyboard": [buttons[i:i + 2] for i in range(0, len(buttons), 2)]} if buttons else None,
+            "disable_notification": silent,
+            "change_indexes": sorted({ci for ci, _ in chatter}),
+            "targets": chatter,
+            "silent_topics": silent,
+        })
+
+    if conn is not None and callback_buttons_enabled(conn):
+        conn.commit()
+    return payloads
+
+
+def save_telegram_message(conn, message_id, payload):
+    """Remember what a notification looked like so the bot's « Back can restore it."""
+    if conn is None or not message_id:
+        return
+    conn.execute('''INSERT OR REPLACE INTO telegram_messages
+                    (chat_id, message_id, text, reply_markup_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)''',
+                 (str(TELEGRAM_CHAT_ID), str(message_id), payload["text"],
+                  json.dumps(payload.get("reply_markup")) if payload.get("reply_markup") else None,
+                  datetime.now().isoformat()))
+    conn.commit()
+
+
 def send_telegram_notification(changes, conn=None):
     """Send Telegram notification"""
     if not changes or not (TELEGRAM_ENABLED or DRY_RUN):
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payloads = build_telegram_payloads(changes, conn)
+    if TELEGRAM_LAYOUT == "classic":
+        payloads = build_telegram_payloads(changes, conn)
+    else:
+        payloads = build_digest_payloads(changes, conn)
     sent = 0
 
     if DRY_RUN:
@@ -1613,6 +1901,13 @@ def send_telegram_notification(changes, conn=None):
                 # Attachments reply to the first message part of their change.
                 if message_id and not changes[change_index].get("telegram_message_id"):
                     changes[change_index]["telegram_message_id"] = message_id
+            for change_index, topic_index in payload.get("targets", []):
+                # In the digest layout, a topic's attachments reply to the message it appeared in.
+                topic = changes[change_index]["topic_details"][topic_index]
+                topic["telegram_message_id"] = message_id
+                topic["silent"] = bool(payload.get("disable_notification"))
+            if payload.get("reply_markup"):
+                save_telegram_message(conn, message_id, payload)
             sent += 1
         print(f"Telegram notification sent ({sent} message part(s))")
         return True
@@ -1664,8 +1959,8 @@ def queue_new_attachments(conn, changes):
                                       (attachment["url"], attachment.get("label") or "",
                                        change.get("course_code", ""), topic.get("topic_id", ""),
                                        topic.get("topic_title", ""), attachment.get("post_id") or "",
-                                       str(change.get("telegram_message_id") or ""),
-                                       1 if change.get("silent") else 0, now, now))
+                                       str(topic.get("telegram_message_id") or change.get("telegram_message_id") or ""),
+                                       1 if topic.get("silent", change.get("silent")) else 0, now, now))
                 queued += cursor.rowcount
     conn.commit()
     if queued:
