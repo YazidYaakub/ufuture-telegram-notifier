@@ -239,6 +239,9 @@ volumes:
 | `SCRAPER_ALERT_AFTER` | Send one Telegram alert after N consecutive failed runs, and a recovery message when it works again; `0` disables | `3` |
 | `TOPIC_DETAIL_MODE` | `changed` fetches topic pages only for weeks whose counts changed (plus a full fetch when the database has no topics yet); `all` fetches up to `TOPIC_DETAIL_LIMIT` topics every run | `changed` |
 | `TELEGRAM_SILENT_CLASSMATE_REPLIES` | Send notifications silently when they only contain classmates' replies; new topics, posts by the topic creator, and replies to your posts still notify with sound | `true` |
+| `TELEGRAM_SEND_ATTACHMENTS` | Download attachments from new posts with the logged-in UiTM session and send them into Telegram as a reply to their notification. Files are held in memory only and never written to disk | `true` |
+| `ATTACHMENT_MAX_MB` | Largest attachment sent as a file; bigger ones get an "Open in UiTM" link instead (Telegram's bot upload limit is 50 MB) | `20` |
+| `ATTACHMENT_MAX_PER_RUN` | Maximum attachments sent per scraper run; the rest are sent on later runs | `5` |
 | `DRY_RUN` | Print Telegram messages and alerts instead of sending them; use with temporary `DB_PATH`/`SNAPSHOT_PATH` | `false` |
 
 ## Telegram Setup
@@ -339,6 +342,26 @@ last_updated    TIMESTAMP
 UNIQUE(topic_id, post_id)
 ```
 
+### attachment_queue table
+```sql
+url                 TEXT PRIMARY KEY
+label               TEXT
+course_code         TEXT
+topic_id            TEXT
+topic_title         TEXT
+post_id             TEXT
+reply_to_message_id TEXT      -- Telegram notification the file replies to
+silent              INTEGER
+status              TEXT      -- pending, sent, too_large, failed
+attempts            INTEGER
+size_bytes          INTEGER
+telegram_file_id    TEXT      -- lets the file be re-sent without downloading it again
+last_error          TEXT
+created_at          TEXT
+updated_at          TEXT
+```
+File contents are never stored.
+
 ## How It Works
 
 ### First Run
@@ -355,6 +378,7 @@ UNIQUE(topic_id, post_id)
 - Orders posts by posted time (UiTM renders nested replies out of time order)
 - Skips your own posts; a change made only of your own posts sends nothing
 - Tags replies to your posts with `↩️ you` and posts by the topic creator with `📌`, lists attachment names with `📎`
+- Sends attachments from new posts into Telegram as a reply to the notification (attachments that already existed before are not sent). Failed downloads are retried on the next runs, up to 3 attempts
 - Prioritizes changed weeks before spending the topic detail limit, then adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
