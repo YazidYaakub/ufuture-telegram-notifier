@@ -1,5 +1,8 @@
 FROM python:3.10-slim
 
+# uv, pinned to the version that wrote uv.lock
+COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /bin/uv
+
 WORKDIR /app
 
 # Install system dependencies
@@ -7,8 +10,10 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the packages your script needs
-RUN pip install requests beautifulsoup4 lxml schedule
+# Install exactly the versions in uv.lock (--frozen fails the build if the lock is out of date)
+COPY pyproject.toml uv.lock ./
+RUN UV_PYTHON_DOWNLOADS=never uv sync --frozen --no-dev --no-install-project
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy application file
 COPY ufuture-scraper.py .

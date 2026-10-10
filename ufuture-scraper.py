@@ -69,6 +69,8 @@ TELEGRAM_SEND_ATTACHMENTS = os.getenv("TELEGRAM_SEND_ATTACHMENTS", "true").strip
 ATTACHMENT_MAX_MB = float(os.getenv("ATTACHMENT_MAX_MB", "20"))
 ATTACHMENT_MAX_PER_RUN = int(os.getenv("ATTACHMENT_MAX_PER_RUN", "5"))
 ATTACHMENT_MAX_ATTEMPTS = 3
+INLINE_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024  # Bot API limit for sendPhoto
 DETAIL_BACKFILL_VERSION = "1"
 LOCAL_UTC_OFFSET_HOURS = float(os.getenv("LOCAL_UTC_OFFSET_HOURS", "8"))
 TELEGRAM_LAYOUT = os.getenv("TELEGRAM_LAYOUT", "digest").strip().lower()
@@ -302,7 +304,8 @@ def init_db():
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )''')
-    
+    ensure_column(c, "attachment_queue", "telegram_file_kind", "TEXT")
+
     conn.commit()
     return conn
 
@@ -2065,6 +2068,39 @@ def telegram_api(method, data, files=None, timeout=30):
     )
 
 
+def is_inline_photo(filename, size_bytes):
+    extension = os.path.splitext(filename or "")[1].lower()
+    return extension in INLINE_PHOTO_EXTENSIONS and size_bytes <= TELEGRAM_PHOTO_MAX_BYTES
+
+
+def sent_file_id(result_json, kind):
+    result = (result_json or {}).get("result") or {}
+    if kind == "photo":
+        sizes = result.get("photo") or []
+        return sizes[-1].get("file_id") if sizes else None
+    return (result.get("document") or {}).get("file_id")
+
+
+def upload_telegram_file(fields, filename, buffer):
+    """Send images as inline photos (falling back to a file if Telegram refuses); everything else as a file.
+
+    Returns (response, kind) where kind is "photo" or "document".
+    """
+    if is_inline_photo(filename, buffer.getbuffer().nbytes):
+        buffer.seek(0)
+        response = telegram_api("sendPhoto", fields, files={"photo": (filename, buffer)}, timeout=120)
+        if response.status_code == 200:
+            return response, "photo"
+        print(f"Telegram sendPhoto failed (HTTP {response.status_code}); sending {filename} as a file")
+    buffer.seek(0)
+    return telegram_api("sendDocument", fields, files={"document": (filename, buffer)}, timeout=120), "document"
+
+
+def resend_telegram_file(fields, file_id, kind):
+    method, field = ("sendPhoto", "photo") if kind == "photo" else ("sendDocument", "document")
+    return telegram_api(method, {**fields, field: file_id})
+
+
 def attachment_reply_fields(row):
     fields = {"chat_id": TELEGRAM_CHAT_ID, "disable_notification": bool(row["silent"])}
     if row["reply_to_message_id"]:
@@ -2110,23 +2146,17 @@ def send_queued_attachments(conn, session):
                 response.close()
 
             caption = truncate_text(f"📎 {label}\n{row['course_code']} · {row['topic_title']}", 1000)
-            result = telegram_api(
-                "sendDocument",
-                {**attachment_reply_fields(row), "caption": caption},
-                files={"document": (filename, buffer)},
-                timeout=120,
-            )
+            result, kind = upload_telegram_file({**attachment_reply_fields(row), "caption": caption}, filename, buffer)
             if result.status_code != 200:
-                raise ScraperError(f"Telegram sendDocument failed: HTTP {result.status_code}")
-            document = (result.json().get("result") or {}).get("document") or {}
+                raise ScraperError(f"Telegram upload failed: HTTP {result.status_code}")
             update_attachment(
                 conn, row["url"],
                 status="sent", attempts=row["attempts"] + 1,
                 size_bytes=buffer.getbuffer().nbytes,
-                telegram_file_id=document.get("file_id"), last_error=None,
+                telegram_file_id=sent_file_id(result.json(), kind), telegram_file_kind=kind, last_error=None,
             )
             sent += 1
-            print(f"Sent attachment to Telegram: {filename} ({format_size(buffer.getbuffer().nbytes)})")
+            print(f"Sent attachment to Telegram as {kind}: {filename} ({format_size(buffer.getbuffer().nbytes)})")
         except AttachmentTooLarge as error:
             text = (
                 f"📎 {label} is too large to send here "
