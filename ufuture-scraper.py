@@ -9,7 +9,7 @@ import re
 import socket
 import time
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import sys
@@ -58,7 +58,7 @@ TELEGRAM_SHORT_NAMES = os.getenv("TELEGRAM_SHORT_NAMES", "true").strip().lower()
 TELEGRAM_MEDIA_BUTTONS = os.getenv("TELEGRAM_MEDIA_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_REPLY_TARGET_LIMIT = int(os.getenv("TELEGRAM_REPLY_TARGET_LIMIT", "8"))
 TELEGRAM_BUTTON_MODE = os.getenv("TELEGRAM_BUTTON_MODE", "hybrid").strip().lower()
-TELEGRAM_ACTION_TTL_HOURS = int(os.getenv("TELEGRAM_ACTION_TTL_HOURS", "72"))
+TELEGRAM_ACTION_TTL_HOURS = int(os.getenv("TELEGRAM_ACTION_TTL_HOURS", "720"))
 TELEGRAM_REPLY_DRAFT_TTL_HOURS = int(os.getenv("TELEGRAM_REPLY_DRAFT_TTL_HOURS", "24"))
 TELEGRAM_INTERACTIVE_BOT = os.getenv("TELEGRAM_INTERACTIVE_BOT", "true").strip().lower() in {"1", "true", "yes", "on"}
 UFUTURE_POST_REPLIES = os.getenv("UFUTURE_POST_REPLIES", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -70,6 +70,7 @@ ATTACHMENT_MAX_MB = float(os.getenv("ATTACHMENT_MAX_MB", "20"))
 ATTACHMENT_MAX_PER_RUN = int(os.getenv("ATTACHMENT_MAX_PER_RUN", "5"))
 ATTACHMENT_MAX_ATTEMPTS = 3
 DETAIL_BACKFILL_VERSION = "1"
+LOCAL_UTC_OFFSET_HOURS = float(os.getenv("LOCAL_UTC_OFFSET_HOURS", "8"))
 TELEGRAM_LAYOUT = os.getenv("TELEGRAM_LAYOUT", "digest").strip().lower()
 
 EXIT_OK = 0
@@ -249,6 +250,10 @@ def init_db():
     ensure_column(c, "telegram_pending_replies", "result_message", "TEXT")
     ensure_column(c, "telegram_pending_replies", "dedupe_key", "TEXT")
     ensure_column(c, "telegram_pending_replies", "attachments_json", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "preview_message_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "origin_message_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "targets_json", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "topic_choices_json", "TEXT")
 
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
@@ -257,6 +262,18 @@ def init_db():
 
     # Notifications as sent, so the interactive bot can restore them after
     # editing a message into a topic card.
+    # Which topic(s) a sent message is about, so swipe-replies know what they answer.
+    # position -1 is a temporary override while the message shows a topic card.
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_message_topics (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        topic_id TEXT NOT NULL,
+        target_post_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id, position)
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_messages (
         chat_id TEXT NOT NULL,
         message_id TEXT NOT NULL,
@@ -1617,11 +1634,16 @@ def clock_time(moment):
     return moment.strftime("%I:%M %p").lstrip("0")
 
 
+def local_now():
+    """Wall-clock time where the forum is (UiTM shows Malaysia time); the container runs in UTC."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
+
+
 def relative_time(value, now=None):
     moment = parse_posted_time(value)
     if not moment:
         return str(value or "")
-    now = now or datetime.now()
+    now = now or local_now()
     days = (now.date() - moment.date()).days
     if days == 0:
         return f"today {clock_time(moment)}"
@@ -1749,11 +1771,20 @@ def build_digest_text(items, total_topics):
 def topic_button(conn, change, topic, label):
     if not TELEGRAM_INLINE_BUTTONS or not topic.get("topic_url"):
         return None
-    if callback_buttons_enabled(conn):
-        card_topic = dict(topic, card_text=build_topic_card_text(change, topic))
-        action_id = create_telegram_action(conn, "topic", change, card_topic)
-        return {"text": label, "callback_data": f"o:{action_id}"}
+    if callback_buttons_enabled(conn) and topic.get("topic_id"):
+        # The topic id itself (not a stored action) so the button keeps working indefinitely.
+        return {"text": label, "callback_data": f"ot:{topic['topic_id']}"}
     return {"text": label, "url": topic["topic_url"]}
+
+
+def reply_target_id(topic, featured=True):
+    """Post a swipe-reply answers by default: the featured post of an important message, else the original post."""
+    candidates = featured_posts(topic) if featured else []
+    candidates = candidates + [topic.get("root_post") or {}]
+    for post in candidates:
+        if post.get("post_id") and post.get("replyable", True) and not post.get("is_own"):
+            return post["post_id"]
+    return ""
 
 
 def week_fallback_text(change):
@@ -1799,6 +1830,7 @@ def build_digest_payloads(changes, conn=None):
             "change_indexes": [change_index],
             "targets": [(change_index, topic_index)],
             "silent_topics": False,
+            "topic_targets": [(topic.get("topic_id"), reply_target_id(topic))],
         })
 
     if chatter:
@@ -1817,6 +1849,7 @@ def build_digest_payloads(changes, conn=None):
             "change_indexes": sorted({ci for ci, _ in chatter}),
             "targets": chatter,
             "silent_topics": silent,
+            "topic_targets": [(topic.get("topic_id"), reply_target_id(topic, featured=False)) for _, topic in items],
         })
 
     if conn is not None and callback_buttons_enabled(conn):
@@ -1834,6 +1867,13 @@ def save_telegram_message(conn, message_id, payload):
                  (str(TELEGRAM_CHAT_ID), str(message_id), payload["text"],
                   json.dumps(payload.get("reply_markup")) if payload.get("reply_markup") else None,
                   datetime.now().isoformat()))
+    for position, (topic_id, target_post_id) in enumerate(payload.get("topic_targets") or []):
+        if topic_id:
+            conn.execute('''INSERT OR REPLACE INTO telegram_message_topics
+                            (chat_id, message_id, position, topic_id, target_post_id, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)''',
+                         (str(TELEGRAM_CHAT_ID), str(message_id), position, topic_id,
+                          target_post_id or "", datetime.now().isoformat()))
     conn.commit()
 
 
@@ -1916,7 +1956,7 @@ def send_telegram_notification(changes, conn=None):
                 topic = changes[change_index]["topic_details"][topic_index]
                 topic["telegram_message_id"] = message_id
                 topic["silent"] = bool(payload.get("disable_notification"))
-            if payload.get("reply_markup"):
+            if payload.get("reply_markup") or payload.get("topic_targets"):
                 save_telegram_message(conn, message_id, payload)
             sent += 1
         print(f"Telegram notification sent ({sent} message part(s))")
@@ -2212,7 +2252,7 @@ def prune_old_courses(conn, current_codes):
 
 def record_run_status(ok, reason=""):
     """Last success/failure for the bot's /status command; never fails the run."""
-    stamp = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    stamp = local_now().strftime("%d/%m/%Y %I:%M %p")
     values = {"last_success_at": stamp} if ok else {"last_failure_at": stamp, "last_failure_reason": reason[:200]}
     try:
         conn = sqlite3.connect(DB_FILE, timeout=30)

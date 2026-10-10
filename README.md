@@ -224,7 +224,7 @@ volumes:
 | `TELEGRAM_REPLY_TARGET_LIMIT` | Maximum recent replyable posts offered as Telegram reply targets, excluding the original post | `8` |
 | `TELEGRAM_INTERACTIVE_BOT` | Run the long-polling interactive Telegram bot worker | `true` |
 | `TELEGRAM_BUTTON_MODE` | Button behavior; `hybrid` uses callback buttons for Details/Reply and URL buttons for Media/Open | `hybrid` |
-| `TELEGRAM_ACTION_TTL_HOURS` | How long notification callback actions remain valid | `72` |
+| `TELEGRAM_ACTION_TTL_HOURS` | How long file and legacy buttons remain valid; topic buttons never expire | `720` |
 | `TELEGRAM_REPLY_DRAFT_TTL_HOURS` | How long pending Telegram reply drafts remain valid | `24` |
 | `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
 | `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
@@ -244,6 +244,7 @@ volumes:
 | `ATTACHMENT_MAX_MB` | Largest attachment sent as a file; bigger ones get an "Open in UiTM" link instead (Telegram's bot upload limit is 50 MB) | `20` |
 | `ATTACHMENT_MAX_PER_RUN` | Maximum attachments sent per scraper run; the rest are sent on later runs | `5` |
 | `TELEGRAM_LAYOUT` | `digest` sends one message with sound per important topic (new topic, lecturer/topic-creator post, reply to you) plus one silent summary of classmates' replies per run; `classic` keeps one message per changed week | `digest` |
+| `LOCAL_UTC_OFFSET_HOURS` | Hours ahead of UTC for times shown in Telegram (UiTM uses Malaysia time; the container runs in UTC) | `8` |
 | `DRY_RUN` | Print Telegram messages and alerts instead of sending them; use with temporary `DB_PATH`/`SNAPSHOT_PATH` | `false` |
 
 ## Telegram Setup
@@ -401,6 +402,7 @@ The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts
 | `/files` | Pick a course, then tap a file to get it in the chat |
 | `/status` | Last successful check, last failure and reason, counts, attachment queue, muted courses |
 | `/mute CSC649`, `/unmute CSC649` | Silence a course; replies to your posts still notify. Without a code, shows course buttons |
+| `/drafts` | Continue a saved reply draft (saved drafts are kept for 7 days) |
 | `/help` | Lists the commands; the bot also shows a hint when you send text without an open reply draft |
 | `/cancel` | Cancel the current reply draft |
 
@@ -409,6 +411,11 @@ Files already sent to Telegram are re-sent instantly from their Telegram `file_i
 Courses that are no longer on your UiTM dashboard (for example last semester's) are deleted from the database, with their weeks, topics, posts and queued files, at the end of each successful scrape. A course whose page fails to load in a run is kept; a failed run deletes nothing.
 
 The first run after upgrading re-reads every topic page once (up to `TOPIC_DETAIL_LIMIT`) to fill in attachments and your own posts for data stored by older versions. No notifications are sent for this refresh.
+
+### Replying from Telegram
+- **Swipe to reply:** swipe-reply to any notification, topic card or list message and type (or send a file). The bot drafts a reply to the post shown in that message; on the classmate summary it first asks which topic.
+- **Or** tap `▸` then `✍️ Reply`, pick who you're replying to (the original post first, then the newest replies), and type.
+- The draft is one message: `📤 Send to UiTM`, `✏️ Edit text`, `🎯 Change target`, `🗑 Remove files`, `💾 Save`, `✖ Cancel`. New text or files replace it with a fresh preview at the bottom of the chat; the result (`✅ Posted`) appears in the same message.
 
 ### Interactive Telegram Bot
 - `Topic ▸` opens the topic card in place; `« Back` restores the original notification.
