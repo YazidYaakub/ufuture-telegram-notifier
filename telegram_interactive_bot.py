@@ -955,39 +955,27 @@ def fetch_attachment(url, fallback_name):
     return filename, buffer
 
 
-def send_document(chat_id, document, caption, *, filename=None, reply_to=None):
-    data = {"chat_id": chat_id, "caption": caption}
-    if reply_to:
-        data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
-    files = None
-    if filename is None:
-        data["document"] = document  # Telegram file_id of a file sent before
-    else:
-        files = {"document": (filename, document)}
-    try:
-        response = requests.post(f"{API_BASE}/sendDocument", data=data, files=files, timeout=120)
-    except requests.RequestException as error:
-        print(f"Telegram sendDocument error: {type(error).__name__}")
-        return None
-    if response.status_code != 200:
-        print(f"Telegram sendDocument failed: HTTP {response.status_code}")
-        return None
-    return response.json().get("result")
-
-
-def remember_sent_file(conn, attachment, size_bytes, file_id):
+def remember_sent_file(conn, attachment, size_bytes, file_id, kind):
     now = datetime.now().isoformat()
     conn.execute('''INSERT INTO attachment_queue
                     (url, label, course_code, topic_id, topic_title, post_id, reply_to_message_id,
-                     silent, status, attempts, size_bytes, telegram_file_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, '', '', 0, 'sent', 1, ?, ?, ?, ?)
+                     silent, status, attempts, size_bytes, telegram_file_id, telegram_file_kind, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, '', '', 0, 'sent', 1, ?, ?, ?, ?, ?)
                     ON CONFLICT(url) DO UPDATE SET
                         status = 'sent', size_bytes = excluded.size_bytes,
-                        telegram_file_id = excluded.telegram_file_id, updated_at = excluded.updated_at''',
+                        telegram_file_id = excluded.telegram_file_id,
+                        telegram_file_kind = excluded.telegram_file_kind, updated_at = excluded.updated_at''',
                  (attachment["url"], attachment.get("label") or "", attachment.get("course_code") or "",
                   attachment.get("topic_id") or "", attachment.get("topic_title") or "",
-                  size_bytes, file_id, now, now))
+                  size_bytes, file_id, kind, now, now))
     conn.commit()
+
+
+def file_reply_fields(chat_id, caption, reply_to):
+    fields = {"chat_id": chat_id, "caption": caption}
+    if reply_to:
+        fields["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
+    return fields
 
 
 def handle_send_file(conn, callback, action_id):
@@ -1002,14 +990,18 @@ def handle_send_file(conn, callback, action_id):
     label = attachment.get("label") or "attachment"
     caption = truncate_text(f"📎 {label}\n{attachment.get('course_code', '')} · {attachment.get('topic_title', '')}", 1000)
 
+    fields = file_reply_fields(chat_id, caption, message_id)
     known = conn.execute(
-        "SELECT telegram_file_id FROM attachment_queue WHERE url = ? AND COALESCE(telegram_file_id, '') != ''",
+        "SELECT telegram_file_id, telegram_file_kind FROM attachment_queue WHERE url = ? AND COALESCE(telegram_file_id, '') != ''",
         (attachment.get("url"),),
     ).fetchone()
     if known:
         answer_callback(callback["id"], "Sending…")
-        if send_document(chat_id, known["telegram_file_id"], caption, reply_to=message_id):
-            return
+        try:
+            if s.resend_telegram_file(fields, known["telegram_file_id"], known["telegram_file_kind"] or "document").status_code == 200:
+                return
+        except requests.RequestException as error:
+            print(f"Telegram re-send error: {type(error).__name__}")
     else:
         answer_callback(callback["id"], "Fetching from UiTM…")
 
@@ -1031,11 +1023,15 @@ def handle_send_file(conn, callback, action_id):
             reply_to_message_id=message_id,
         )
         return
-    result = send_document(chat_id, buffer, caption, filename=filename, reply_to=message_id)
-    if not result:
+    try:
+        response, kind = s.upload_telegram_file(fields, filename, buffer)
+    except requests.RequestException as error:
+        print(f"Telegram upload error: {type(error).__name__}")
+        response, kind = None, None
+    if response is None or response.status_code != 200:
         send_message(chat_id, f"Telegram rejected the upload of {html_text(label)}.", reply_to_message_id=message_id)
         return
-    remember_sent_file(conn, attachment, buffer.getbuffer().nbytes, (result.get("document") or {}).get("file_id"))
+    remember_sent_file(conn, attachment, buffer.getbuffer().nbytes, s.sent_file_id(response.json(), kind), kind)
 
 
 # ---- command and navigation routing -------------------------------------------
