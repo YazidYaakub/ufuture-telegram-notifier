@@ -32,6 +32,8 @@ TELEGRAM_ALLOWED_USER_IDS = {
     for item in (value.strip() for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(","))
     if item and item.lower() not in TELEGRAM_ALLOWED_USER_IDS_PLACEHOLDERS
 }
+MESSAGE_RETENTION_DAYS = 30
+DETAILS_MAX_LENGTH = 3900
 DROP_PENDING_UPDATES = os.getenv("TELEGRAM_DROP_PENDING_UPDATES", "true").strip().lower() in {"1", "true", "yes", "on"}
 API_BASE = ("https://api.telegram.org/" + "bot" + TG_TOKEN) if TG_TOKEN else ""
 RUNNING = True
@@ -112,6 +114,14 @@ def init_db(conn):
         key TEXT PRIMARY KEY,
         value TEXT
     )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS telegram_messages (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reply_markup_json TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
+    )''')
     conn.commit()
 
 
@@ -142,6 +152,8 @@ def cleanup_expired(conn):
     now = datetime.now().isoformat()
     conn.execute("DELETE FROM telegram_actions WHERE expires_at < ?", (now,))
     conn.execute("DELETE FROM telegram_pending_replies WHERE expires_at < ?", (now,))
+    stored_cutoff = (datetime.now() - timedelta(days=MESSAGE_RETENTION_DAYS)).isoformat()
+    conn.execute("DELETE FROM telegram_messages WHERE created_at < ?", (stored_cutoff,))
     conn.commit()
 
 
@@ -175,6 +187,19 @@ def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     return telegram_post("sendMessage", data)
 
 
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    return telegram_post("editMessageText", data)
+
+
 def answer_callback(callback_id, text=None):
     data = {"callback_query_id": callback_id}
     if text:
@@ -186,7 +211,8 @@ def load_action(conn, action_id, expected_type=None):
     row = conn.execute("SELECT * FROM telegram_actions WHERE action_id = ?", (action_id,)).fetchone()
     if not row:
         return None, "Action expired or not found."
-    if expected_type and row["action_type"] != expected_type:
+    expected_types = (expected_type,) if isinstance(expected_type, str) else expected_type
+    if expected_types and row["action_type"] not in expected_types:
         return None, "This button no longer matches the expected action."
     try:
         expires_at = datetime.fromisoformat(row["expires_at"])
@@ -342,7 +368,20 @@ def build_details_text(row):
         lines.extend(["", "No stored reply excerpt is available for this topic."])
     if row["topic_url"]:
         lines.extend(["", f"Open topic: {html_text(row['topic_url'])}"])
-    return "\n".join(lines)
+    return clip_html_lines(lines, DETAILS_MAX_LENGTH)
+
+
+def clip_html_lines(lines, max_length):
+    """Drop whole lines (never cut inside a tag) to fit Telegram's message limit."""
+    text = "\n".join(lines)
+    if len(text) <= max_length:
+        return text
+    kept = []
+    for line in lines:
+        if len("\n".join(kept + [line, "…"])) > max_length:
+            break
+        kept.append(line)
+    return "\n".join(kept + ["…"])
 
 
 def start_reply_draft(conn, row, chat_id, user_id, action_id, target):
@@ -438,8 +477,62 @@ def handle_details(conn, callback, action_id):
     send_message(message["chat"]["id"], build_details_text(row), reply_to_message_id=message.get("message_id"))
 
 
+def topic_card_keyboard(action_id, topic_url):
+    rows = [[
+        {"text": "📄 Details", "callback_data": f"cd:{action_id}"},
+        {"text": "✍️ Reply", "callback_data": f"r:{action_id}"},
+    ]]
+    if topic_url:
+        rows.append([{"text": "🌐 Open in UiTM", "url": topic_url}])
+    rows.append([{"text": "« Back", "callback_data": f"bm:{action_id}"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_open_card(conn, callback, action_id):
+    row, error = load_action(conn, action_id, "topic")
+    if error:
+        answer_callback(callback["id"], error)
+        return
+    message = callback.get("message") or {}
+    topic = action_payload(row).get("topic", {})
+    text = topic.get("card_text") or f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>"
+    answer_callback(callback["id"])
+    edit_message(message["chat"]["id"], message["message_id"], text, topic_card_keyboard(action_id, row["topic_url"]))
+
+
+def handle_card_details(conn, callback, action_id):
+    row, error = load_action(conn, action_id, "topic")
+    if error:
+        answer_callback(callback["id"], error)
+        return
+    message = callback.get("message") or {}
+    rows = [[
+        {"text": "« Back", "callback_data": f"o:{action_id}"},
+        {"text": "✍️ Reply", "callback_data": f"r:{action_id}"},
+    ]]
+    if row["topic_url"]:
+        rows.append([{"text": "🌐 Open in UiTM", "url": row["topic_url"]}])
+    answer_callback(callback["id"])
+    edit_message(message["chat"]["id"], message["message_id"], build_details_text(row), {"inline_keyboard": rows})
+
+
+def handle_back_to_message(conn, callback):
+    message = callback.get("message") or {}
+    chat_id = message["chat"]["id"]
+    stored = conn.execute(
+        "SELECT text, reply_markup_json FROM telegram_messages WHERE chat_id = ? AND message_id = ?",
+        (str(chat_id), str(message.get("message_id"))),
+    ).fetchone()
+    if not stored:
+        answer_callback(callback["id"], "Original message is no longer available.")
+        return
+    answer_callback(callback["id"])
+    markup = json.loads(stored["reply_markup_json"]) if stored["reply_markup_json"] else None
+    edit_message(chat_id, message["message_id"], stored["text"], markup)
+
+
 def handle_reply_start(conn, callback, action_id):
-    row, error = load_action(conn, action_id, "reply")
+    row, error = load_action(conn, action_id, ("reply", "topic"))
     if error:
         answer_callback(callback["id"], error)
         return
@@ -463,7 +556,7 @@ def handle_reply_start(conn, callback, action_id):
 
 
 def handle_reply_target(conn, callback, action_id, target_key):
-    row, error = load_action(conn, action_id, "reply")
+    row, error = load_action(conn, action_id, ("reply", "topic"))
     if error:
         answer_callback(callback["id"], error)
         return
@@ -663,7 +756,13 @@ def handle_callback(conn, callback):
         answer_callback(callback["id"], "Invalid action.")
         return
     prefix, identifier = data.split(":", 1)
-    if prefix == "d":
+    if prefix == "o":
+        handle_open_card(conn, callback, identifier)
+    elif prefix == "cd":
+        handle_card_details(conn, callback, identifier)
+    elif prefix == "bm":
+        handle_back_to_message(conn, callback)
+    elif prefix == "d":
         handle_details(conn, callback, identifier)
     elif prefix == "r":
         handle_reply_start(conn, callback, identifier)
