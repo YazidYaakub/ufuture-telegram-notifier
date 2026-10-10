@@ -2167,6 +2167,40 @@ def apply_course_mutes(conn, changes):
     return kept or None
 
 
+def prune_old_courses(conn, current_codes):
+    """Delete courses that are no longer on the dashboard (e.g. last semester) and their data.
+
+    current_codes comes from the dashboard course cards, not from forums that loaded,
+    so a course whose page failed to load this run is kept.
+    """
+    current_codes = {code for code in current_codes if code}
+    if not current_codes:
+        return []
+    stored = set()
+    for table in ("courses", "weeks", "topics"):
+        stored |= {row[0] for row in conn.execute(f"SELECT DISTINCT course_code FROM {table}")}
+    old_codes = sorted(code for code in stored - current_codes if code)
+    if not old_codes:
+        return []
+
+    marks = ",".join("?" for _ in old_codes)
+    conn.execute(
+        f"DELETE FROM posts WHERE topic_id IN (SELECT topic_id FROM topics WHERE course_code IN ({marks}))",
+        old_codes,
+    )
+    for table in ("topics", "weeks", "courses", "attachment_queue", "telegram_actions"):
+        conn.execute(f"DELETE FROM {table} WHERE course_code IN ({marks})", old_codes)
+    muted = muted_courses(conn)
+    if muted & set(old_codes):
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_bot_state (key, value) VALUES ('muted_courses', ?)",
+            (json.dumps(sorted(muted - set(old_codes))),),
+        )
+    conn.commit()
+    print(f"Removed {len(old_codes)} old course(s) no longer on the dashboard: {', '.join(old_codes)}")
+    return old_codes
+
+
 def record_run_status(ok, reason=""):
     """Last success/failure for the bot's /status command; never fails the run."""
     stamp = datetime.now().strftime("%d/%m/%Y %I:%M %p")
@@ -2358,6 +2392,9 @@ def run_scrape():
     
     # Save snapshot
     save_current_snapshot(current, current_topics, current_posts)
+
+    # Only after a fully successful scrape: drop courses that left the dashboard.
+    prune_old_courses(conn, [course["course_code"] for course in courses])
     
     print(f"Completed: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     conn.close()
