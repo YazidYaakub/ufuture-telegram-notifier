@@ -1,7 +1,9 @@
 import html
 import hashlib
+import importlib.util
 import json
 import os
+import re
 import secrets
 import signal
 import sqlite3
@@ -477,14 +479,17 @@ def handle_details(conn, callback, action_id):
     send_message(message["chat"]["id"], build_details_text(row), reply_to_message_id=message.get("message_id"))
 
 
-def topic_card_keyboard(action_id, topic_url):
+def topic_card_keyboard(action_id, topic_url, *, back=None, has_files=False):
     rows = [[
         {"text": "📄 Details", "callback_data": f"cd:{action_id}"},
         {"text": "✍️ Reply", "callback_data": f"r:{action_id}"},
     ]]
+    if has_files:
+        rows.append([{"text": "📎 Files", "callback_data": f"tf:{action_id}"}])
     if topic_url:
         rows.append([{"text": "🌐 Open in UiTM", "url": topic_url}])
-    rows.append([{"text": "« Back", "callback_data": f"bm:{action_id}"}])
+    # Cards opened from /latest or /courses go back to that list; from a notification, to the notification.
+    rows.append([{"text": "« Back", "callback_data": back or f"bm:{action_id}"}])
     return {"inline_keyboard": rows}
 
 
@@ -496,8 +501,16 @@ def handle_open_card(conn, callback, action_id):
     message = callback.get("message") or {}
     topic = action_payload(row).get("topic", {})
     text = topic.get("card_text") or f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>"
+    try:
+        has_files = bool(attachment_rows(conn, "p.topic_id = ?", (row["topic_id"],)))
+    except Exception as error:
+        print(f"Topic file lookup failed: {type(error).__name__}")
+        has_files = False
     answer_callback(callback["id"])
-    edit_message(message["chat"]["id"], message["message_id"], text, topic_card_keyboard(action_id, row["topic_url"]))
+    edit_message(
+        message["chat"]["id"], message["message_id"], text,
+        topic_card_keyboard(action_id, row["topic_url"], back=topic.get("back"), has_files=has_files),
+    )
 
 
 def handle_card_details(conn, callback, action_id):
@@ -739,6 +752,512 @@ def handle_cancel(conn, callback, pending_id):
     )
 
 
+# ============================================================================
+# Commands, browsing and files
+# Reuses the scraper module for UiTM login, downloads and formatting.
+# ============================================================================
+
+SCRAPER_FILE = os.getenv(
+    "SCRAPER_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ufuture-scraper.py")
+)
+LIST_LIMIT = 20
+BOT_COMMANDS = [
+    ("latest", "Newest forum posts"),
+    ("courses", "Browse courses, weeks and topics"),
+    ("files", "Get attachments from a course"),
+    ("status", "Scraper health and counts"),
+    ("mute", "Mute a course (replies to you still notify)"),
+    ("unmute", "Unmute a course"),
+    ("help", "What this bot can do"),
+    ("cancel", "Cancel the current reply draft"),
+]
+HELP_TEXT = "\n".join([
+    "<b>UiTM forum bot</b>",
+    "",
+    "/latest: newest forum posts",
+    "/courses: browse courses, weeks and topics",
+    "/files: get attachments from a course",
+    "/status: scraper health and counts",
+    "/mute, /unmute: silence a course (replies to you still notify)",
+    "/cancel: cancel a reply draft",
+    "",
+    "Tap ▸ on a notification to open its topic card, then ✍️ Reply to draft a reply.",
+])
+_scraper_module = None
+_uitm_session = None
+
+
+def scraper():
+    global _scraper_module
+    if _scraper_module is None:
+        spec = importlib.util.spec_from_file_location("ufuture_scraper", SCRAPER_FILE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _scraper_module = module
+    return _scraper_module
+
+
+def show(chat_id, message_id, text, reply_markup=None):
+    """Edit the message when navigating from a button, otherwise send a new one."""
+    if message_id:
+        return edit_message(chat_id, message_id, text, reply_markup)
+    return send_message(chat_id, text, reply_markup=reply_markup)
+
+
+def button_rows(buttons, per_row):
+    return [buttons[index:index + per_row] for index in range(0, len(buttons), per_row)]
+
+
+def week_sort_key(week_title):
+    match = re.search(r"week\s*(\d+)", week_title or "", re.IGNORECASE)
+    return (int(match.group(1)) if match else 999, week_title or "")
+
+
+def course_label(row):
+    name = scraper().course_display_name({"course_code": row["course_code"], "course_name": row["course_name"]})
+    return truncate_text(f"{row['course_code']} · {name.title()}", 40)
+
+
+# ---- topic views built from the database ----------------------------------
+
+def topic_view(conn, topic_id):
+    s = scraper()
+    row = conn.execute('''SELECT t.course_code, t.week_title, t.topic_id, t.topic_title, t.topic_url,
+                                 t.created_by, t.replies, t.last_activity, c.course_name
+                          FROM topics t LEFT JOIN courses c ON c.course_code = t.course_code
+                          WHERE t.topic_id = ?
+                          ORDER BY t.last_updated DESC
+                          LIMIT 1''', (topic_id,)).fetchone()
+    if not row:
+        return None, None
+    topic = {
+        "topic_id": row["topic_id"],
+        "topic_title": row["topic_title"],
+        "topic_url": row["topic_url"],
+        "created_by": row["created_by"],
+        "replies": row["replies"] or 0,
+        "last_activity": row["last_activity"],
+    }
+    posts = s.annotate_topic_posts(topic, s.get_current_post_state(conn, [topic_id]))
+    others = [post for post in posts if not post.get("is_own")]
+    detail = s.build_topic_detail(
+        topic, posts, [], is_new_topic=False, exact_post_diff=True, display_posts=others[-10:],
+    )
+    change = {
+        "course_code": row["course_code"],
+        "course_name": row["course_name"] or row["course_code"],
+        "week": row["week_title"],
+    }
+    return change, detail
+
+
+def create_topic_action(conn, topic_id, back):
+    s = scraper()
+    change, detail = topic_view(conn, topic_id)
+    if not detail:
+        return None
+    payload_topic = dict(detail, card_text=s.build_topic_card_text(change, detail), back=back)
+    action_id = s.create_telegram_action(conn, "topic", change, payload_topic)
+    conn.commit()
+    return action_id
+
+
+def attachment_rows(conn, where, params):
+    s = scraper()
+    rows = conn.execute(f'''SELECT p.attachments_json, p.posted_time, p.topic_id,
+                                   t.course_code, t.week_title, t.topic_title
+                            FROM posts p JOIN topics t ON t.topic_id = p.topic_id
+                            WHERE {where}''', params).fetchall()
+    attachments, seen = [], set()
+    for row in rows:
+        for attachment in s.parse_attachments_json(row["attachments_json"]):
+            url = attachment.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            attachments.append({
+                "url": url,
+                "label": attachment.get("label") or s.media_label_from_url(url),
+                "posted_time": row["posted_time"],
+                "topic_id": row["topic_id"],
+                "course_code": row["course_code"],
+                "week": row["week_title"],
+                "topic_title": row["topic_title"],
+            })
+    attachments.sort(key=lambda item: s.parse_posted_time(item["posted_time"]) or datetime.min, reverse=True)
+    return attachments
+
+
+def file_buttons(conn, attachments):
+    s = scraper()
+    buttons = []
+    for index, attachment in enumerate(attachments, start=1):
+        change = {"course_code": attachment["course_code"], "week": attachment["week"]}
+        action_id = s.create_telegram_action(
+            conn, "file", change, {"topic_id": attachment["topic_id"], "attachment": attachment},
+        )
+        buttons.append({"text": f"📎 {index}", "callback_data": f"f:{action_id}"})
+    conn.commit()
+    return buttons
+
+
+def file_list_lines(attachments):
+    s = scraper()
+    lines = []
+    for index, attachment in enumerate(attachments, start=1):
+        lines.append(f"{index}. {html_text(attachment['label'])}")
+        lines.append(
+            f"   {html_text(s.short_week(attachment['week']))} · {html_text(attachment['topic_title'])}"
+            f" · {html_text(s.absolute_time(attachment['posted_time']))}"
+        )
+    return lines
+
+
+# ---- renderers (text, keyboard) ---------------------------------------------
+
+def render_courses(conn, *, for_files=False):
+    rows = conn.execute("SELECT course_code, course_name FROM courses ORDER BY course_code").fetchall()
+    if not rows:
+        return "No courses have been scraped yet.", None
+    prefix = "fs" if for_files else "cs"
+    title = "📎 <b>Files</b>: pick a course" if for_files else "📚 <b>Courses</b>"
+    buttons = [{"text": course_label(row), "callback_data": f"{prefix}:{row['course_code']}"} for row in rows]
+    return title, {"inline_keyboard": button_rows(buttons, 1)}
+
+
+def render_course_weeks(conn, course_code):
+    s = scraper()
+    weeks = [
+        row for row in conn.execute(
+            "SELECT id, week_title, topics, posts FROM weeks WHERE course_code = ?", (course_code,)
+        ).fetchall()
+        if s.parse_count(row["topics"]) > 0
+    ]
+    weeks.sort(key=lambda row: week_sort_key(row["week_title"]))
+    lines = [f"📚 <b>{html_text(course_code)}</b>"]
+    if not weeks:
+        lines.append("No topics yet.")
+    for row in weeks:
+        topics = s.parse_count(row["topics"])
+        posts = s.parse_count(row["posts"])
+        lines.append(
+            f"{html_text(s.short_week(row['week_title']))} · {s.format_count(topics, 'topic')}"
+            f" · {s.format_count(posts, 'post')}"
+        )
+    buttons = [{"text": s.short_week(row["week_title"]), "callback_data": f"cw:{row['id']}"} for row in weeks]
+    rows = button_rows(buttons, 4) + [[{"text": "« Courses", "callback_data": "cc:"}]]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def render_week_topics(conn, week_id):
+    s = scraper()
+    week = conn.execute("SELECT course_code, week_title FROM weeks WHERE id = ?", (week_id,)).fetchone()
+    if not week:
+        return "This week is no longer available.", {"inline_keyboard": [[{"text": "« Courses", "callback_data": "cc:"}]]}
+    topics = conn.execute('''SELECT topic_id, topic_title, replies, last_activity FROM topics
+                             WHERE course_code = ? AND week_title = ?
+                             ORDER BY topic_title''', (week["course_code"], week["week_title"])).fetchall()
+    lines = [f"📚 <b>{html_text(week['course_code'])}</b> · {html_text(s.short_week(week['week_title']))}"]
+    buttons = []
+    for row in topics:
+        lines.append(
+            f"🧵 {html_text(row['topic_title'])} · {s.format_count(row['replies'] or 0, 'reply', 'replies')}"
+        )
+        action_id = create_topic_action(conn, row["topic_id"], back=f"cw:{week_id}")
+        if action_id:
+            buttons.append({"text": f"{truncate_text(row['topic_title'], 30)} ▸", "callback_data": f"o:{action_id}"})
+    if not topics:
+        lines.append("No topic details stored for this week yet.")
+    rows = button_rows(buttons, 1) + [[{"text": f"« {week['course_code']}", "callback_data": f"cs:{week['course_code']}"}]]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def render_latest(conn, limit=5):
+    s = scraper()
+    rows = conn.execute('''SELECT DISTINCT p.topic_id, p.post_id, p.author, p.content_excerpt, p.posted_time,
+                                  p.is_own, t.course_code, t.week_title, t.topic_title
+                           FROM posts p JOIN topics t ON t.topic_id = p.topic_id''').fetchall()
+    rows = [row for row in rows if not row["is_own"]]
+    rows.sort(key=lambda row: s.parse_posted_time(row["posted_time"]) or datetime.min, reverse=True)
+    rows = rows[:limit]
+    if not rows:
+        return "No forum posts stored yet.", None
+    lines = ["🕐 <b>Latest forum posts</b>"]
+    buttons, topic_actions = [], {}
+    for index, row in enumerate(rows, start=1):
+        lines.append("")
+        lines.append(
+            f"{index}. {html_text(row['course_code'])} {html_text(s.short_week(row['week_title']))}"
+            f" · <b>{html_text(row['topic_title'])}</b>"
+        )
+        lines.append(
+            f"   {html_text(s.short_person(row['author']))} · {html_text(s.relative_time(row['posted_time']))}:"
+            f" {html_text(truncate_text(row['content_excerpt'], 90))}"
+        )
+        if row["topic_id"] not in topic_actions:
+            topic_actions[row["topic_id"]] = create_topic_action(conn, row["topic_id"], back="lt:")
+        if topic_actions[row["topic_id"]]:
+            buttons.append({"text": f"{index} ▸", "callback_data": f"o:{topic_actions[row['topic_id']]}"})
+    return "\n".join(lines), {"inline_keyboard": button_rows(buttons, 5)}
+
+
+def render_course_files(conn, course_code):
+    attachments = attachment_rows(conn, "t.course_code = ?", (course_code,))[:LIST_LIMIT]
+    back = [[{"text": "« Courses", "callback_data": "fc:"}]]
+    if not attachments:
+        return f"📎 <b>{html_text(course_code)}</b>\nNo attachments found.", {"inline_keyboard": back}
+    lines = [f"📎 <b>{html_text(course_code)} files</b>", ""] + file_list_lines(attachments)
+    rows = button_rows(file_buttons(conn, attachments), 5) + back
+    return clip_html_lines(lines, DETAILS_MAX_LENGTH), {"inline_keyboard": rows}
+
+
+def render_topic_files(conn, topic_action_id):
+    row, error = load_action(conn, topic_action_id, "topic")
+    if error:
+        return error, None
+    attachments = attachment_rows(conn, "p.topic_id = ?", (row["topic_id"],))[:LIST_LIMIT]
+    topic = action_payload(row).get("topic", {})
+    back = [[{"text": "« Back", "callback_data": f"o:{topic_action_id}"}]]
+    lines = [f"📎 <b>{html_text(topic.get('topic_title') or 'Topic')} files</b>", ""]
+    if not attachments:
+        return "\n".join(lines + ["No attachments found."]), {"inline_keyboard": back}
+    rows = button_rows(file_buttons(conn, attachments), 5) + back
+    return clip_html_lines(lines + file_list_lines(attachments), DETAILS_MAX_LENGTH), {"inline_keyboard": rows}
+
+
+def parse_bot_time(value):
+    try:
+        return datetime.strptime(value or "", "%d/%m/%Y %I:%M %p")
+    except ValueError:
+        return None
+
+
+def render_status(conn):
+    s = scraper()
+    last_ok = get_state(conn, "last_success_at")
+    last_fail = get_state(conn, "last_failure_at")
+    counts = {
+        name: conn.execute(query).fetchone()[0]
+        for name, query in {
+            "courses": "SELECT count(*) FROM courses",
+            "topics": "SELECT count(DISTINCT topic_id) FROM topics",
+            "posts": "SELECT count(*) FROM posts",
+        }.items()
+    }
+    files = dict(conn.execute("SELECT status, count(*) FROM attachment_queue GROUP BY status").fetchall())
+    muted = sorted(s.muted_courses(conn))
+    lines = ["📊 <b>Forum bot status</b>", ""]
+    lines.append(f"✅ Last successful check: {html_text(s.relative_time(last_ok)) if last_ok else 'none recorded yet'}")
+    if last_fail and (not last_ok or (parse_bot_time(last_fail) or datetime.min) > (parse_bot_time(last_ok) or datetime.min)):
+        reason = get_state(conn, "last_failure_reason") or "unknown"
+        lines.append(f"⚠️ Last failure: {html_text(s.relative_time(last_fail))} · {html_text(reason)}")
+    lines.append(
+        f"📚 {s.format_count(counts['courses'], 'course')} · {s.format_count(counts['topics'], 'topic')}"
+        f" · {s.format_count(counts['posts'], 'post')} tracked"
+    )
+    lines.append(
+        f"📎 Files sent: {files.get('sent', 0)} · waiting: {files.get('pending', 0)}"
+        f" · too large: {files.get('too_large', 0)} · failed: {files.get('failed', 0)}"
+    )
+    lines.append(f"🔕 Muted: {html_text(', '.join(muted))}" if muted else "🔔 No muted courses")
+    lines.append("")
+    lines.append("The forum is checked every 10 minutes.")
+    return "\n".join(lines), None
+
+
+def render_mute_picker(conn, *, unmute):
+    s = scraper()
+    muted = s.muted_courses(conn)
+    rows = conn.execute("SELECT course_code, course_name FROM courses ORDER BY course_code").fetchall()
+    rows = [row for row in rows if (row["course_code"] in muted) == unmute]
+    if not rows:
+        return ("No courses are muted." if unmute else "All courses are already muted."), None
+    prefix = "um" if unmute else "mu"
+    title = "🔔 Unmute which course?" if unmute else "🔕 Mute which course? Replies to your posts will still notify."
+    buttons = [{"text": course_label(row), "callback_data": f"{prefix}:{row['course_code']}"} for row in rows]
+    return title, {"inline_keyboard": button_rows(buttons, 1)}
+
+
+def set_course_muted(conn, course_code, muted):
+    s = scraper()
+    course_code = (course_code or "").strip().upper()
+    if not conn.execute("SELECT 1 FROM courses WHERE course_code = ?", (course_code,)).fetchone():
+        return f"Unknown course <b>{html_text(course_code)}</b>. Use /courses to see your courses."
+    codes = s.muted_courses(conn)
+    codes = codes | {course_code} if muted else codes - {course_code}
+    set_state(conn, "muted_courses", json.dumps(sorted(codes)))
+    if muted:
+        return f"🔕 <b>{html_text(course_code)}</b> muted. You'll still be notified when someone replies to your posts."
+    return f"🔔 <b>{html_text(course_code)}</b> unmuted."
+
+
+# ---- files ---------------------------------------------------------------------
+
+def uitm_session(fresh=False):
+    global _uitm_session
+    if _uitm_session is None or fresh:
+        s = scraper()
+        session = requests.Session()
+        session.headers.update(s.HEADERS)
+        s.login(session)
+        _uitm_session = session
+    return _uitm_session
+
+
+def fetch_attachment(url, fallback_name):
+    """Download into memory with the bot's own UiTM session, logging in again once if it expired."""
+    s = scraper()
+    for attempt in (1, 2):
+        try:
+            response = s.open_attachment(uitm_session(fresh=attempt == 2), url)
+            break
+        except s.LoginError:
+            raise
+        except s.ScraperError:
+            if attempt == 2:
+                raise
+    try:
+        filename = s.attachment_filename(response, fallback_name)
+        buffer = s.download_attachment(response, int(s.ATTACHMENT_MAX_MB * 1024 * 1024))
+    finally:
+        response.close()
+    return filename, buffer
+
+
+def send_document(chat_id, document, caption, *, filename=None, reply_to=None):
+    data = {"chat_id": chat_id, "caption": caption}
+    if reply_to:
+        data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
+    files = None
+    if filename is None:
+        data["document"] = document  # Telegram file_id of a file sent before
+    else:
+        files = {"document": (filename, document)}
+    try:
+        response = requests.post(f"{API_BASE}/sendDocument", data=data, files=files, timeout=120)
+    except requests.RequestException as error:
+        print(f"Telegram sendDocument error: {type(error).__name__}")
+        return None
+    if response.status_code != 200:
+        print(f"Telegram sendDocument failed: HTTP {response.status_code}")
+        return None
+    return response.json().get("result")
+
+
+def remember_sent_file(conn, attachment, size_bytes, file_id):
+    now = datetime.now().isoformat()
+    conn.execute('''INSERT INTO attachment_queue
+                    (url, label, course_code, topic_id, topic_title, post_id, reply_to_message_id,
+                     silent, status, attempts, size_bytes, telegram_file_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, '', '', 0, 'sent', 1, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        status = 'sent', size_bytes = excluded.size_bytes,
+                        telegram_file_id = excluded.telegram_file_id, updated_at = excluded.updated_at''',
+                 (attachment["url"], attachment.get("label") or "", attachment.get("course_code") or "",
+                  attachment.get("topic_id") or "", attachment.get("topic_title") or "",
+                  size_bytes, file_id, now, now))
+    conn.commit()
+
+
+def handle_send_file(conn, callback, action_id):
+    s = scraper()
+    row, error = load_action(conn, action_id, "file")
+    if error:
+        answer_callback(callback["id"], error)
+        return
+    attachment = action_payload(row).get("topic", {}).get("attachment") or {}
+    message = callback.get("message") or {}
+    chat_id, message_id = message["chat"]["id"], message.get("message_id")
+    label = attachment.get("label") or "attachment"
+    caption = truncate_text(f"📎 {label}\n{attachment.get('course_code', '')} · {attachment.get('topic_title', '')}", 1000)
+
+    known = conn.execute(
+        "SELECT telegram_file_id FROM attachment_queue WHERE url = ? AND COALESCE(telegram_file_id, '') != ''",
+        (attachment.get("url"),),
+    ).fetchone()
+    if known:
+        answer_callback(callback["id"], "Sending…")
+        if send_document(chat_id, known["telegram_file_id"], caption, reply_to=message_id):
+            return
+    else:
+        answer_callback(callback["id"], "Fetching from UiTM…")
+
+    try:
+        filename, buffer = fetch_attachment(attachment["url"], label)
+    except s.AttachmentTooLarge as too_large:
+        send_message(
+            chat_id,
+            f"📎 {html_text(label)} is too large to send here ({s.format_size(too_large.size_bytes)},"
+            f" limit {s.ATTACHMENT_MAX_MB:g} MB). Open it in UiTM.",
+            reply_markup={"inline_keyboard": [[{"text": "Open in UiTM", "url": attachment["url"]}]]},
+            reply_to_message_id=message_id,
+        )
+        return
+    except (s.ScraperError, requests.RequestException) as fetch_error:
+        send_message(
+            chat_id,
+            f"Couldn't fetch {html_text(label)} from UiTM: {html_text(s.failure_summary(fetch_error))}",
+            reply_to_message_id=message_id,
+        )
+        return
+    result = send_document(chat_id, buffer, caption, filename=filename, reply_to=message_id)
+    if not result:
+        send_message(chat_id, f"Telegram rejected the upload of {html_text(label)}.", reply_to_message_id=message_id)
+        return
+    remember_sent_file(conn, attachment, buffer.getbuffer().nbytes, (result.get("document") or {}).get("file_id"))
+
+
+# ---- command and navigation routing -------------------------------------------
+
+def handle_command(conn, chat_id, command, argument):
+    if command in {"help", "start"}:
+        show(chat_id, None, HELP_TEXT)
+    elif command == "latest":
+        show(chat_id, None, *render_latest(conn))
+    elif command == "courses":
+        show(chat_id, None, *render_courses(conn))
+    elif command == "files":
+        show(chat_id, None, *render_courses(conn, for_files=True))
+    elif command == "status":
+        show(chat_id, None, *render_status(conn))
+    elif command in {"mute", "unmute"}:
+        if argument:
+            show(chat_id, None, set_course_muted(conn, argument, command == "mute"))
+        else:
+            show(chat_id, None, *render_mute_picker(conn, unmute=command == "unmute"))
+    else:
+        show(chat_id, None, "Unknown command.\n\n" + HELP_TEXT)
+
+
+NAVIGATION_RENDERERS = {
+    "cc": lambda conn, value: render_courses(conn),
+    "cs": render_course_weeks,
+    "cw": lambda conn, value: render_week_topics(conn, int(value)),
+    "lt": lambda conn, value: render_latest(conn),
+    "fc": lambda conn, value: render_courses(conn, for_files=True),
+    "fs": render_course_files,
+    "tf": render_topic_files,
+}
+
+
+def handle_navigation(conn, callback, prefix, value):
+    message = callback.get("message") or {}
+    answer_callback(callback["id"])
+    text, markup = NAVIGATION_RENDERERS[prefix](conn, value)
+    show(message["chat"]["id"], message.get("message_id"), text, markup)
+
+
+def handle_mute_button(conn, callback, course_code, muted):
+    message = callback.get("message") or {}
+    answer_callback(callback["id"], "Muted." if muted else "Unmuted.")
+    show(message["chat"]["id"], message.get("message_id"), set_course_muted(conn, course_code, muted))
+
+
+def register_bot_commands():
+    commands = [{"command": name, "description": description} for name, description in BOT_COMMANDS]
+    telegram_post("setMyCommands", {"commands": json.dumps(commands)})
+
+
 def handle_callback(conn, callback):
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -756,7 +1275,13 @@ def handle_callback(conn, callback):
         answer_callback(callback["id"], "Invalid action.")
         return
     prefix, identifier = data.split(":", 1)
-    if prefix == "o":
+    if prefix in NAVIGATION_RENDERERS:
+        handle_navigation(conn, callback, prefix, identifier)
+    elif prefix == "f":
+        handle_send_file(conn, callback, identifier)
+    elif prefix in {"mu", "um"}:
+        handle_mute_button(conn, callback, identifier, prefix == "mu")
+    elif prefix == "o":
         handle_open_card(conn, callback, identifier)
     elif prefix == "cd":
         handle_card_details(conn, callback, identifier)
@@ -798,14 +1323,26 @@ def handle_message(conn, message):
     text = (message.get("text") or "").strip()
     if not text:
         return
-    if text.lower() == "/cancel":
-        pending = latest_open_reply(conn, chat_id, user_id)
-        if pending:
-            update_pending_state(conn, pending["id"], "cancelled")
-            send_message(chat_id, "Reply draft cancelled.", reply_to_message_id=message.get("message_id"))
+    if text.startswith("/"):
+        command, _, argument = text[1:].partition(" ")
+        command = command.split("@", 1)[0].lower()
+        if command == "cancel":
+            pending = latest_open_reply(conn, chat_id, user_id)
+            if pending:
+                update_pending_state(conn, pending["id"], "cancelled")
+                send_message(chat_id, "Reply draft cancelled.", reply_to_message_id=message.get("message_id"))
+            else:
+                send_message(chat_id, "Nothing to cancel.", reply_to_message_id=message.get("message_id"))
+            return
+        handle_command(conn, chat_id, command, argument.strip())
         return
     pending = latest_pending_reply(conn, chat_id, user_id)
     if not pending:
+        send_message(
+            chat_id,
+            "No reply draft is open. Tap ✍️ Reply on a topic to start one, or see /help.",
+            reply_to_message_id=message.get("message_id"),
+        )
         return
     update_pending_preview(conn, pending["id"], pending, text)
     pending = load_pending(conn, pending["id"])
@@ -893,6 +1430,12 @@ def main():
         return 2
     conn = connect_db()
     init_db(conn)
+    try:
+        # Make sure every table the commands read (courses, posts, attachment_queue, ...) exists.
+        scraper().init_db().close()
+    except Exception as error:
+        print(f"Scraper module unavailable; commands will be limited: {type(error).__name__}")
+    register_bot_commands()
     try:
         poll_updates(conn)
     finally:
