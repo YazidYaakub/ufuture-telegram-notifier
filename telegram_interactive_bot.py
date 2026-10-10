@@ -117,6 +117,19 @@ def init_db(conn):
     ensure_column(conn, "telegram_pending_replies", "result_message", "TEXT")
     ensure_column(conn, "telegram_pending_replies", "dedupe_key", "TEXT")
     ensure_column(conn, "telegram_pending_replies", "attachments_json", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "preview_message_id", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "origin_message_id", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "targets_json", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "topic_choices_json", "TEXT")
+    conn.execute('''CREATE TABLE IF NOT EXISTS telegram_message_topics (
+        chat_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        topic_id TEXT NOT NULL,
+        target_post_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id, position)
+    )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -161,6 +174,7 @@ def cleanup_expired(conn):
     conn.execute("DELETE FROM telegram_pending_replies WHERE expires_at < ?", (now,))
     stored_cutoff = (datetime.now() - timedelta(days=MESSAGE_RETENTION_DAYS)).isoformat()
     conn.execute("DELETE FROM telegram_messages WHERE created_at < ?", (stored_cutoff,))
+    conn.execute("DELETE FROM telegram_message_topics WHERE created_at < ?", (stored_cutoff,))
     conn.commit()
 
 
@@ -257,129 +271,6 @@ def course_display(change):
     return course_code, course_name
 
 
-def replyable_post(post):
-    return bool(post.get("post_id")) and bool(post.get("replyable", True))
-
-
-def target_author_label(author):
-    return truncate_text(author or "Unknown", 24)
-
-
-def reply_targets(row):
-    payload = action_payload(row)
-    topic = payload.get("topic", {})
-    root_post = topic.get("root_post") or {}
-    posts = topic.get("reply_targets") or topic.get("detail_posts") or topic.get("posts", []) or []
-    targets = []
-    if replyable_post(root_post):
-        targets.append({
-            "key": "root",
-            "label": "Original post",
-            "post": root_post,
-        })
-
-    root_post_id = root_post.get("post_id") if root_post else None
-    reply_index = 1
-    seen = {root_post_id} if root_post_id else set()
-    for post in posts:
-        post_id = post.get("post_id")
-        if not post_id or post_id in seen:
-            continue
-        seen.add(post_id)
-        if not replyable_post(post):
-            continue
-        targets.append({
-            "key": f"reply{reply_index}",
-            "label": f"Reply {reply_index}: {target_author_label(post.get('author'))}",
-            "post": post,
-        })
-        reply_index += 1
-        if reply_index > 8:
-            break
-    return targets
-
-
-def find_reply_target(row, target_key):
-    for target in reply_targets(row):
-        if target["key"] == target_key:
-            return target
-    return None
-
-
-def build_target_picker_text(row):
-    payload = action_payload(row)
-    topic = payload.get("topic", {})
-    lines = [
-        f"Choose reply target for <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>:",
-        "",
-    ]
-    targets = reply_targets(row)
-    for target in targets:
-        post = target["post"]
-        lines.append(f"<b>{html_text(target['label'])}</b>")
-        lines.append(html_text(post.get("author") or "Unknown"))
-        if post.get("content_excerpt"):
-            lines.append(html_text(truncate_text(post.get("content_excerpt"), 160)))
-        if post.get("posted_time"):
-            lines.append(html_text(post.get("posted_time")))
-        lines.append("")
-    lines.append("Pick one target, then type your reply.")
-    return "\n".join(lines).strip()
-
-
-def build_target_keyboard(action_id, targets):
-    rows = []
-    for target in targets:
-        rows.append([{"text": target["label"], "callback_data": f"t:{action_id}:{target['key']}"}])
-    rows.append([{"text": "Cancel", "callback_data": "x:reply"}])
-    return {"inline_keyboard": rows}
-
-
-def build_details_text(row):
-    payload = action_payload(row)
-    change = payload.get("change", {})
-    topic = payload.get("topic", {})
-    root_post = topic.get("root_post") or {}
-    posts = topic.get("detail_posts") or topic.get("posts", []) or []
-    course_code, course_name = course_display(change)
-    lines = [
-        f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>",
-        "",
-        f"Course: {html_text(course_code)} - {html_text(course_name)}",
-        f"Week: {html_text(change.get('week'))}",
-    ]
-    if topic.get("replies") is not None:
-        lines.append(f"Total replies: {html_text(topic.get('replies'))}")
-    if topic.get("last_activity"):
-        lines.append(f"Last activity: {html_text(topic.get('last_activity'))}")
-
-    if root_post:
-        lines.extend(["", "<b>Original post</b>"])
-        lines.append(html_text(root_post.get("author") or "Unknown"))
-        if root_post.get("content_excerpt"):
-            lines.append(html_text(root_post.get("content_excerpt")))
-        if root_post.get("posted_time"):
-            lines.append(html_text(root_post.get("posted_time")))
-
-    root_post_id = root_post.get("post_id") if root_post else None
-    thread = topic.get("thread_posts")
-    reply_posts = thread if thread is not None else [post for post in posts if post.get("post_id") != root_post_id]
-    if reply_posts:
-        lines.extend(["", "<b>Latest replies</b>" if thread is not None else "<b>New/latest replies</b>"])
-        for index, post in enumerate(reply_posts[:10], start=1):
-            author = "🙋 You" if post.get("is_own") else html_text(post.get("author") or "Unknown")
-            lines.append(f"{index}. {author}")
-            if post.get("content_excerpt"):
-                lines.append(f"   {html_text(post.get('content_excerpt'))}")
-            if post.get("posted_time"):
-                lines.append(f"   {html_text(post.get('posted_time'))}")
-    elif not root_post:
-        lines.extend(["", "No stored reply excerpt is available for this topic."])
-    if row["topic_url"]:
-        lines.extend(["", f"Open topic: {html_text(row['topic_url'])}"])
-    return clip_html_lines(lines, DETAILS_MAX_LENGTH)
-
-
 def clip_html_lines(lines, max_length):
     """Drop whole lines (never cut inside a tag) to fit Telegram's message limit."""
     text = "\n".join(lines)
@@ -391,50 +282,6 @@ def clip_html_lines(lines, max_length):
             break
         kept.append(line)
     return "\n".join(kept + ["…"])
-
-
-def start_reply_draft(conn, row, chat_id, user_id, action_id, target):
-    payload = action_payload(row)
-    topic = payload.get("topic", {})
-    post = target["post"]
-    now = datetime.now()
-    pending_id = secrets.token_urlsafe(8)
-    expires_at = now + timedelta(hours=max(1, REPLY_DRAFT_TTL_HOURS))
-    conn.execute('''INSERT INTO telegram_pending_replies
-                   (id, chat_id, user_id, topic_id, post_id, topic_url,
-                    source_action_id, target_post_id, target_author, target_excerpt,
-                    target_posted_time, target_label, topic_title, draft_text, state,
-                    created_at, updated_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                 (pending_id, str(chat_id), str(user_id), row["topic_id"] or "",
-                  row["post_id"] or "", row["topic_url"] or "", action_id,
-                  post.get("post_id") or "", post.get("author") or "Unknown",
-                  truncate_text(post.get("content_excerpt"), 500),
-                  post.get("posted_time") or "", target["label"],
-                  topic.get("topic_title") or "Forum topic", "", "awaiting_text",
-                  now.isoformat(), now.isoformat(), expires_at.isoformat()))
-    conn.commit()
-    return pending_id, topic.get("topic_title") or "Forum topic"
-
-
-def latest_pending_reply(conn, chat_id, user_id):
-    return conn.execute('''SELECT * FROM telegram_pending_replies
-                           WHERE chat_id = ? AND user_id = ?
-                             AND state = 'awaiting_text'
-                             AND expires_at >= ?
-                           ORDER BY updated_at DESC
-                           LIMIT 1''',
-                        (str(chat_id), str(user_id), datetime.now().isoformat())).fetchone()
-
-
-def latest_open_reply(conn, chat_id, user_id):
-    return conn.execute('''SELECT * FROM telegram_pending_replies
-                           WHERE chat_id = ? AND user_id = ?
-                             AND state IN ('awaiting_text', 'preview')
-                             AND expires_at >= ?
-                           ORDER BY updated_at DESC
-                           LIMIT 1''',
-                        (str(chat_id), str(user_id), datetime.now().isoformat())).fetchone()
 
 
 def update_pending_state(conn, pending_id, state, draft_text=None):
@@ -479,199 +326,6 @@ def load_pending(conn, pending_id):
     return row
 
 
-def handle_details(conn, callback, action_id):
-    row, error = load_action(conn, action_id, "details")
-    if error:
-        answer_callback(callback["id"], error)
-        return
-    answer_callback(callback["id"], "Details opened.")
-    message = callback.get("message") or {}
-    send_message(message["chat"]["id"], build_details_text(row), reply_to_message_id=message.get("message_id"))
-
-
-def topic_card_keyboard(action_id, topic_url, *, back=None, has_files=False):
-    rows = [[
-        {"text": "📄 Details", "callback_data": f"cd:{action_id}"},
-        {"text": "✍️ Reply", "callback_data": f"r:{action_id}"},
-    ]]
-    if has_files:
-        rows.append([{"text": "📎 Files", "callback_data": f"tf:{action_id}"}])
-    if topic_url:
-        rows.append([{"text": "🌐 Open in UiTM", "url": topic_url}])
-    # Cards opened from /latest or /courses go back to that list; from a notification, to the notification.
-    rows.append([{"text": "« Back", "callback_data": back or f"bm:{action_id}"}])
-    return {"inline_keyboard": rows}
-
-
-def handle_open_card(conn, callback, action_id):
-    row, error = load_action(conn, action_id, "topic")
-    if error:
-        answer_callback(callback["id"], error)
-        return
-    message = callback.get("message") or {}
-    topic = action_payload(row).get("topic", {})
-    text = topic.get("card_text") or f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>"
-    try:
-        has_files = bool(attachment_rows(conn, "p.topic_id = ?", (row["topic_id"],)))
-    except Exception as error:
-        print(f"Topic file lookup failed: {type(error).__name__}")
-        has_files = False
-    answer_callback(callback["id"])
-    edit_message(
-        message["chat"]["id"], message["message_id"], text,
-        topic_card_keyboard(action_id, row["topic_url"], back=topic.get("back"), has_files=has_files),
-    )
-
-
-def handle_card_details(conn, callback, action_id):
-    row, error = load_action(conn, action_id, "topic")
-    if error:
-        answer_callback(callback["id"], error)
-        return
-    message = callback.get("message") or {}
-    rows = [[
-        {"text": "« Back", "callback_data": f"o:{action_id}"},
-        {"text": "✍️ Reply", "callback_data": f"r:{action_id}"},
-    ]]
-    if row["topic_url"]:
-        rows.append([{"text": "🌐 Open in UiTM", "url": row["topic_url"]}])
-    answer_callback(callback["id"])
-    edit_message(message["chat"]["id"], message["message_id"], build_details_text(row), {"inline_keyboard": rows})
-
-
-def handle_back_to_message(conn, callback):
-    message = callback.get("message") or {}
-    chat_id = message["chat"]["id"]
-    stored = conn.execute(
-        "SELECT text, reply_markup_json FROM telegram_messages WHERE chat_id = ? AND message_id = ?",
-        (str(chat_id), str(message.get("message_id"))),
-    ).fetchone()
-    if not stored:
-        answer_callback(callback["id"], "Original message is no longer available.")
-        return
-    answer_callback(callback["id"])
-    markup = json.loads(stored["reply_markup_json"]) if stored["reply_markup_json"] else None
-    edit_message(chat_id, message["message_id"], stored["text"], markup)
-
-
-def handle_reply_start(conn, callback, action_id):
-    row, error = load_action(conn, action_id, ("reply", "topic"))
-    if error:
-        answer_callback(callback["id"], error)
-        return
-    message = callback.get("message") or {}
-    targets = reply_targets(row)
-    if not targets:
-        answer_callback(callback["id"], "No replyable target was captured.")
-        send_message(
-            message["chat"]["id"],
-            "No replyable target was captured for this topic yet. Open the topic in UiTM to reply manually.",
-            reply_to_message_id=message.get("message_id"),
-        )
-        return
-    answer_callback(callback["id"], "Choose reply target.")
-    send_message(
-        message["chat"]["id"],
-        build_target_picker_text(row),
-        reply_markup=build_target_keyboard(action_id, targets),
-        reply_to_message_id=message.get("message_id"),
-    )
-
-
-def handle_reply_target(conn, callback, action_id, target_key):
-    row, error = load_action(conn, action_id, ("reply", "topic"))
-    if error:
-        answer_callback(callback["id"], error)
-        return
-    target = find_reply_target(row, target_key)
-    if not target:
-        answer_callback(callback["id"], "Target expired or unavailable.")
-        return
-    message = callback.get("message") or {}
-    user = callback.get("from") or {}
-    pending_id, topic_title = start_reply_draft(
-        conn,
-        row,
-        message["chat"]["id"],
-        user.get("id"),
-        action_id,
-        target,
-    )
-    answer_callback(callback["id"], "Reply target selected.")
-    post = target["post"]
-    send_message(
-        message["chat"]["id"],
-        "\n".join([
-            f"Reply draft for <b>{html_text(topic_title)}</b>",
-            "",
-            f"Target: <b>{html_text(target['label'])}</b>",
-            html_text(post.get("author") or "Unknown"),
-            html_text(truncate_text(post.get("content_excerpt"), 220)),
-            "",
-            "Type your reply message here, and send files to attach them.",
-            "Send /cancel to stop.",
-            "",
-            f"Draft id: <code>{html_text(pending_id)}</code>",
-        ]),
-        reply_to_message_id=message.get("message_id"),
-    )
-
-
-def build_preview_text(row):
-    lines = [
-        f"Preview reply to <b>{html_text(row['topic_title'])}</b>",
-        "",
-        f"Target: <b>{html_text(row['target_label'] or 'Selected post')}</b>",
-        html_text(row["target_author"] or "Unknown"),
-    ]
-    if row["target_excerpt"]:
-        lines.append(html_text(row["target_excerpt"]))
-    if row["target_posted_time"]:
-        lines.append(html_text(row["target_posted_time"]))
-    files = draft_attachments(row)
-    lines.extend([
-        "",
-        "<b>Your reply</b>",
-        html_text(row["draft_text"]) if (row["draft_text"] or "").strip() else "<i>(no text yet: type your message)</i>",
-    ])
-    if files:
-        lines.append(f"📎 {len(files)} file(s): " + html_text(", ".join(item.get("name") or "file" for item in files)))
-    lines.append("")
-    lines.append("Send files (as documents for full quality) to attach them.")
-    if POST_REPLIES_ENABLED:
-        if REPLY_CONFIRM_BEFORE_SEND:
-            lines.append("Confirm before sending to UiTM.")
-        else:
-            lines.append("Reply posting is enabled. Use Send to UiTM to continue.")
-    else:
-        lines.append("UiTM posting is disabled. You can save this as a draft.")
-    return "\n".join(lines)
-
-
-def build_preview_keyboard(pending_id, has_files=False):
-    rows = [[
-        {"text": "Send to UiTM", "callback_data": f"p:{pending_id}"},
-        {"text": "✏️ Edit text", "callback_data": f"e:{pending_id}"},
-    ]]
-    if has_files:
-        rows.append([{"text": "🗑 Remove files", "callback_data": f"rf:{pending_id}"}])
-    rows.append([
-        {"text": "Save Draft", "callback_data": f"s:{pending_id}"},
-        {"text": "Cancel", "callback_data": f"c:{pending_id}"},
-    ])
-    return {"inline_keyboard": rows}
-
-
-def send_preview(conn, chat_id, pending_id, reply_to_message_id=None):
-    pending = load_pending(conn, pending_id)
-    send_message(
-        chat_id,
-        build_preview_text(pending),
-        reply_markup=build_preview_keyboard(pending_id, has_files=bool(draft_attachments(pending))),
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
 def telegram_file_from_message(message):
     document = message.get("document")
     if document:
@@ -693,65 +347,6 @@ def telegram_file_from_message(message):
             "mime": "image/jpeg",
         }
     return None
-
-
-def handle_draft_file(conn, chat_id, message, pending, item):
-    reply_to = message.get("message_id")
-    attachments = draft_attachments(pending)
-    if item["size"] > TELEGRAM_DOWNLOAD_MAX_BYTES:
-        send_message(chat_id, f"📎 {html_text(item['name'])} is over 20 MB, the largest file a Telegram bot can download.", reply_to_message_id=reply_to)
-        return
-    if len(attachments) >= REPLY_MAX_FILES:
-        send_message(chat_id, f"A reply can have at most {REPLY_MAX_FILES} files.", reply_to_message_id=reply_to)
-        return
-    if all(existing.get("file_unique_id") != item["file_unique_id"] for existing in attachments):
-        attachments.append(item)
-    draft_text = (message.get("caption") or "").strip() or pending["draft_text"] or ""
-    update_pending_preview(conn, pending["id"], pending, draft_text, attachments)
-    send_preview(conn, chat_id, pending["id"], reply_to)
-
-
-def handle_remove_files(conn, callback, pending_id):
-    row = load_pending(conn, pending_id)
-    if not row or row["state"] not in ("preview", "awaiting_text"):
-        answer_callback(callback["id"], "Draft expired or not found.")
-        return
-    update_pending_preview(conn, pending_id, row, row["draft_text"] or "", [])
-    answer_callback(callback["id"], "Files removed.")
-    send_preview(conn, callback["message"]["chat"]["id"], pending_id, callback["message"].get("message_id"))
-
-
-def handle_save_draft(conn, callback, pending_id):
-    row = load_pending(conn, pending_id)
-    if not row:
-        answer_callback(callback["id"], "Draft expired or not found.")
-        return
-    update_pending_state(conn, pending_id, "saved")
-    answer_callback(callback["id"], "Draft saved.")
-    send_message(
-        callback["message"]["chat"]["id"],
-        f"Draft saved for <b>{html_text(row['topic_title'])}</b>. No UiTM post was made.",
-        reply_to_message_id=callback["message"].get("message_id"),
-    )
-
-
-def handle_edit_draft(conn, callback, pending_id):
-    row = load_pending(conn, pending_id)
-    if not row:
-        answer_callback(callback["id"], "Draft expired or not found.")
-        return
-    update_pending_state(conn, pending_id, "awaiting_text")
-    answer_callback(callback["id"], "Edit draft.")
-    send_message(
-        callback["message"]["chat"]["id"],
-        "\n".join([
-            f"Editing reply for <b>{html_text(row['topic_title'])}</b>",
-            "",
-            "Type the replacement reply message.",
-            "Send /cancel to stop.",
-        ]),
-        reply_to_message_id=callback["message"].get("message_id"),
-    )
 
 
 # ---- posting replies to UiTM ------------------------------------------------
@@ -984,6 +579,9 @@ def handle_send_reply(conn, callback, pending_id):
     result = submit_reply_to_ufuture(row)
     open_button = {"inline_keyboard": [[{"text": "🌐 Open in UiTM", "url": row["topic_url"]}]]} if row["topic_url"] else None
     files = draft_attachments(row)
+    def finish(text, markup=None):
+        edit_message(chat_id, message_id, text, markup)
+
     if result["status"] == "posted":
         update_pending_result(conn, pending_id, "posted", result["message"])
         try:
@@ -991,41 +589,25 @@ def handle_send_reply(conn, callback, pending_id):
         except Exception as error:
             print(f"Topic refresh after posting failed: {type(error).__name__}")
         set_state(conn, "last_reply_posted_at", datetime.now().isoformat())
-        lines = [f"✅ <b>Posted to UiTM</b> · {html_text(row['topic_title'])}", f"Reply to {html_text(row['target_label'] or 'selected post')}"]
+        lines = [f"✅ <b>Posted to UiTM</b> · {html_text(row['topic_title'])}", target_line(row), "",
+                 html_text(row["draft_text"] or "")]
         if files:
-            lines.append(f"📎 {len(files)} file(s) attached")
+            lines.append(f"📎 {html_text(', '.join(item.get('name') or 'file' for item in files))}")
         if result["message"] != "Posted to UiTM.":
             lines.append(f"⚠️ {html_text(result['message'])}")
-        send_message(chat_id, "\n".join(lines), reply_markup=open_button, reply_to_message_id=message_id)
+        finish("\n".join(lines), open_button)
     elif result["status"] == "not_sent":
         update_pending_result(conn, pending_id, "preview", result["message"])
-        send_message(
-            chat_id,
-            f"❌ Not posted: {html_text(result['message'])}\nYour draft is unchanged; tap Send to UiTM to try again.",
-            reply_to_message_id=message_id,
-        )
+        text, markup = preview_view(load_pending(conn, pending_id))
+        finish(f"❌ <b>Not posted:</b> {html_text(result['message'])}\nYour draft is unchanged; tap Send to try again.\n\n{text}", markup)
     else:
         update_pending_result(conn, pending_id, "unverified", result["message"])
         set_state(conn, "last_reply_posted_at", datetime.now().isoformat())
-        send_message(
-            chat_id,
-            f"⚠️ The reply was submitted, but I couldn't confirm it: {html_text(result['message'])}.\n"
-            "Check the topic in UiTM before sending it again.",
-            reply_markup=open_button,
-            reply_to_message_id=message_id,
+        finish(
+            f"⚠️ <b>Submitted, but not confirmed</b> · {html_text(row['topic_title'])}\n"
+            f"{html_text(result['message'])}.\nCheck the topic in UiTM before sending it again.",
+            open_button,
         )
-
-
-def handle_cancel(conn, callback, pending_id):
-    row = load_pending(conn, pending_id)
-    if row:
-        update_pending_state(conn, pending_id, "cancelled")
-    answer_callback(callback["id"], "Cancelled.")
-    send_message(
-        callback["message"]["chat"]["id"],
-        "Reply draft cancelled.",
-        reply_to_message_id=callback["message"].get("message_id"),
-    )
 
 
 # ============================================================================
@@ -1042,6 +624,7 @@ BOT_COMMANDS = [
     ("courses", "Browse courses, weeks and topics"),
     ("files", "Get attachments from a course"),
     ("status", "Scraper health and counts"),
+    ("drafts", "Saved reply drafts"),
     ("mute", "Mute a course (replies to you still notify)"),
     ("unmute", "Unmute a course"),
     ("help", "What this bot can do"),
@@ -1054,10 +637,12 @@ HELP_TEXT = "\n".join([
     "/courses: browse courses, weeks and topics",
     "/files: get attachments from a course",
     "/status: scraper health and counts",
+    "/drafts: continue a saved reply draft",
     "/mute, /unmute: silence a course (replies to you still notify)",
     "/cancel: cancel a reply draft",
     "",
-    "Tap ▸ on a notification to open its topic card, then ✍️ Reply to draft a reply.",
+    "To reply on the forum, swipe-reply to a topic message and type (or send a file),",
+    "or tap ▸ on a notification, then ✍️ Reply.",
 ])
 _scraper_module = None
 _uitm_session = None
@@ -1125,17 +710,6 @@ def topic_view(conn, topic_id):
         "week": row["week_title"],
     }
     return change, detail
-
-
-def create_topic_action(conn, topic_id, back):
-    s = scraper()
-    change, detail = topic_view(conn, topic_id)
-    if not detail:
-        return None
-    payload_topic = dict(detail, card_text=s.build_topic_card_text(change, detail), back=back)
-    action_id = s.create_telegram_action(conn, "topic", change, payload_topic)
-    conn.commit()
-    return action_id
 
 
 def attachment_rows(conn, where, params):
@@ -1239,9 +813,7 @@ def render_week_topics(conn, week_id):
         lines.append(
             f"🧵 {html_text(row['topic_title'])} · {s.format_count(row['replies'] or 0, 'reply', 'replies')}"
         )
-        action_id = create_topic_action(conn, row["topic_id"], back=f"cw:{week_id}")
-        if action_id:
-            buttons.append({"text": f"{truncate_text(row['topic_title'], 30)} ▸", "callback_data": f"o:{action_id}"})
+        buttons.append({"text": f"{truncate_text(row['topic_title'], 30)} ▸", "callback_data": f"ot:{row['topic_id']}:cw:{week_id}"})
     if not topics:
         lines.append("No topic details stored for this week yet.")
     rows = button_rows(buttons, 1) + [[{"text": f"« {week['course_code']}", "callback_data": f"cs:{week['course_code']}"}]]
@@ -1259,7 +831,7 @@ def render_latest(conn, limit=5):
     if not rows:
         return "No forum posts stored yet.", None
     lines = ["🕐 <b>Latest forum posts</b>"]
-    buttons, topic_actions = [], {}
+    buttons = []
     for index, row in enumerate(rows, start=1):
         lines.append("")
         lines.append(
@@ -1270,10 +842,7 @@ def render_latest(conn, limit=5):
             f"   {html_text(s.short_person(row['author']))} · {html_text(s.relative_time(row['posted_time']))}:"
             f" {html_text(truncate_text(row['content_excerpt'], 90))}"
         )
-        if row["topic_id"] not in topic_actions:
-            topic_actions[row["topic_id"]] = create_topic_action(conn, row["topic_id"], back="lt:")
-        if topic_actions[row["topic_id"]]:
-            buttons.append({"text": f"{index} ▸", "callback_data": f"o:{topic_actions[row['topic_id']]}"})
+        buttons.append({"text": f"{index} ▸", "callback_data": f"ot:{row['topic_id']}:lt:"})
     return "\n".join(lines), {"inline_keyboard": button_rows(buttons, 5)}
 
 
@@ -1285,20 +854,6 @@ def render_course_files(conn, course_code):
     lines = [f"📎 <b>{html_text(course_code)} files</b>", ""] + file_list_lines(attachments)
     rows = button_rows(file_buttons(conn, attachments), 5) + back
     return clip_html_lines(lines, DETAILS_MAX_LENGTH), {"inline_keyboard": rows}
-
-
-def render_topic_files(conn, topic_action_id):
-    row, error = load_action(conn, topic_action_id, "topic")
-    if error:
-        return error, None
-    attachments = attachment_rows(conn, "p.topic_id = ?", (row["topic_id"],))[:LIST_LIMIT]
-    topic = action_payload(row).get("topic", {})
-    back = [[{"text": "« Back", "callback_data": f"o:{topic_action_id}"}]]
-    lines = [f"📎 <b>{html_text(topic.get('topic_title') or 'Topic')} files</b>", ""]
-    if not attachments:
-        return "\n".join(lines + ["No attachments found."]), {"inline_keyboard": back}
-    rows = button_rows(file_buttons(conn, attachments), 5) + back
-    return clip_html_lines(lines + file_list_lines(attachments), DETAILS_MAX_LENGTH), {"inline_keyboard": rows}
 
 
 def parse_bot_time(value):
@@ -1512,7 +1067,6 @@ NAVIGATION_RENDERERS = {
     "lt": lambda conn, value: render_latest(conn),
     "fc": lambda conn, value: render_courses(conn, for_files=True),
     "fs": render_course_files,
-    "tf": render_topic_files,
 }
 
 
@@ -1534,6 +1088,617 @@ def register_bot_commands():
     telegram_post("setMyCommands", {"commands": json.dumps(commands)})
 
 
+# ============================================================================
+# Topic cards, details and the reply flow
+# Topic buttons carry the topic id (ot:/od:/or:/of:), so they never expire.
+# The reply flow keeps one draft message and edits it instead of adding new ones.
+# ============================================================================
+
+OPEN_DRAFT_STATES = ("choosing_topic", "choosing_target", "awaiting_text", "preview")
+SAVED_DRAFT_TTL_DAYS = 7
+MAX_REPLY_TARGETS = 8
+
+
+def split_topic_ref(identifier):
+    """'<topic_id>' or '<topic_id>:<back callback>' -> (topic_id, back or None)."""
+    topic_id, _, back = (identifier or "").partition(":")
+    return topic_id, (back or None)
+
+
+def topic_ref(topic_id, back=None):
+    return f"{topic_id}:{back}" if back else topic_id
+
+
+def short_name(post):
+    if post.get("is_own"):
+        return "🙋 You"
+    return scraper().short_person(post.get("author"))
+
+
+# ---- message <-> topic mapping (for swipe-to-reply) -----------------------
+
+def set_card_topic(conn, chat_id, message_id, topic_id):
+    conn.execute('''INSERT OR REPLACE INTO telegram_message_topics
+                    (chat_id, message_id, position, topic_id, target_post_id, created_at)
+                    VALUES (?, ?, -1, ?, '', ?)''',
+                 (str(chat_id), str(message_id), topic_id, datetime.now().isoformat()))
+    conn.commit()
+
+
+def clear_card_topic(conn, chat_id, message_id):
+    conn.execute("DELETE FROM telegram_message_topics WHERE chat_id = ? AND message_id = ? AND position = -1",
+                 (str(chat_id), str(message_id)))
+    conn.commit()
+
+
+def message_topics(conn, chat_id, message_id):
+    rows = conn.execute('''SELECT position, topic_id, target_post_id FROM telegram_message_topics
+                           WHERE chat_id = ? AND message_id = ? ORDER BY position''',
+                        (str(chat_id), str(message_id))).fetchall()
+    override = [row for row in rows if row["position"] == -1]
+    rows = override or rows
+    return [{"topic_id": row["topic_id"], "target_post_id": row["target_post_id"] or ""} for row in rows]
+
+
+# ---- topic card and details ---------------------------------------------------
+
+def topic_card_view(conn, topic_id, back=None):
+    s = scraper()
+    change, detail = topic_view(conn, topic_id)
+    if not detail:
+        return "This topic is no longer stored.", None
+    ref = topic_ref(topic_id, back)
+    rows = [[
+        {"text": "📄 Details", "callback_data": f"od:{ref}"},
+        {"text": "✍️ Reply", "callback_data": f"or:{topic_id}"},
+    ]]
+    if attachment_rows(conn, "p.topic_id = ?", (topic_id,)):
+        rows.append([{"text": "📎 Files", "callback_data": f"of:{ref}"}])
+    if detail.get("topic_url"):
+        rows.append([{"text": "🌐 Open in UiTM", "url": detail["topic_url"]}])
+    # From a notification, Back restores the notification; from a list, it returns to the list.
+    rows.append([{"text": "« Back", "callback_data": back or "bm:"}])
+    return s.build_topic_card_text(change, detail), {"inline_keyboard": rows}
+
+
+def details_text(change, topic):
+    s = scraper()
+    lines = [
+        f"🧵 <b>{html_text(topic.get('topic_title') or 'Forum topic')}</b>",
+        f"{html_text(change.get('course_code'))} · {html_text(s.short_week(change.get('week')))}"
+        f" · {s.format_count(topic.get('replies') or 0, 'reply', 'replies')}",
+    ]
+    root = topic.get("root_post") or {}
+    if root:
+        lines += ["", "<b>Original post</b>", f"{html_text(short_name(root))} · {html_text(s.absolute_time(root.get('posted_time')))}"]
+        if root.get("content_excerpt"):
+            lines.append(html_text(root["content_excerpt"]))
+        for attachment in (root.get("attachments") or [])[:5]:
+            lines.append(f"📎 {html_text(attachment.get('label') or 'Attachment')}")
+    thread = topic.get("thread_posts")
+    if thread is None:  # notification payloads from older versions
+        root_id = root.get("post_id")
+        thread = [post for post in topic.get("detail_posts") or topic.get("posts") or [] if post.get("post_id") != root_id]
+    if thread:
+        lines += ["", "<b>Latest replies</b>"]
+        for post in thread[-10:]:
+            lines.append(f"• {html_text(short_name(post))} · {html_text(s.absolute_time(post.get('posted_time')))}")
+            if post.get("content_excerpt"):
+                lines.append(f"  {html_text(post['content_excerpt'])}")
+    elif not root:
+        lines += ["", "No stored posts for this topic yet."]
+    return clip_html_lines(lines, DETAILS_MAX_LENGTH)
+
+
+def build_details_text(row):
+    payload = action_payload(row)
+    return details_text(payload.get("change", {}), payload.get("topic", {}))
+
+
+def topic_details_view(conn, topic_id, back=None):
+    change, detail = topic_view(conn, topic_id)
+    if not detail:
+        return "This topic is no longer stored.", None
+    rows = [[
+        {"text": "« Back", "callback_data": f"ot:{topic_ref(topic_id, back)}"},
+        {"text": "✍️ Reply", "callback_data": f"or:{topic_id}"},
+    ]]
+    if detail.get("topic_url"):
+        rows.append([{"text": "🌐 Open in UiTM", "url": detail["topic_url"]}])
+    return details_text(change, detail), {"inline_keyboard": rows}
+
+
+def topic_files_view(conn, topic_id, back=None):
+    change, detail = topic_view(conn, topic_id)
+    title = (detail or {}).get("topic_title") or "Topic"
+    attachments = attachment_rows(conn, "p.topic_id = ?", (topic_id,))[:LIST_LIMIT]
+    back_row = [[{"text": "« Back", "callback_data": f"ot:{topic_ref(topic_id, back)}"}]]
+    lines = [f"📎 <b>{html_text(title)} files</b>", ""]
+    if not attachments:
+        return "\n".join(lines + ["No attachments found."]), {"inline_keyboard": back_row}
+    rows = button_rows(file_buttons(conn, attachments), 5) + back_row
+    return clip_html_lines(lines + file_list_lines(attachments), DETAILS_MAX_LENGTH), {"inline_keyboard": rows}
+
+
+def handle_topic_view(conn, callback, prefix, identifier):
+    message = callback.get("message") or {}
+    chat_id, message_id = message["chat"]["id"], message.get("message_id")
+    topic_id, back = split_topic_ref(identifier)
+    view = {"ot": topic_card_view, "od": topic_details_view, "of": topic_files_view}[prefix]
+    text, markup = view(conn, topic_id, back)
+    answer_callback(callback["id"])
+    set_card_topic(conn, chat_id, message_id, topic_id)
+    edit_message(chat_id, message_id, text, markup)
+
+
+def handle_back_to_message(conn, callback):
+    message = callback.get("message") or {}
+    chat_id = message["chat"]["id"]
+    stored = conn.execute(
+        "SELECT text, reply_markup_json FROM telegram_messages WHERE chat_id = ? AND message_id = ?",
+        (str(chat_id), str(message.get("message_id"))),
+    ).fetchone()
+    if not stored:
+        answer_callback(callback["id"], "Original message is no longer available.")
+        return
+    answer_callback(callback["id"])
+    clear_card_topic(conn, chat_id, message.get("message_id"))
+    markup = json.loads(stored["reply_markup_json"]) if stored["reply_markup_json"] else None
+    edit_message(chat_id, message["message_id"], stored["text"], markup)
+
+
+def legacy_topic_id(conn, action_id):
+    row = conn.execute("SELECT topic_id FROM telegram_actions WHERE action_id = ?", (action_id,)).fetchone()
+    return row["topic_id"] if row else None
+
+
+def handle_details(conn, callback, action_id):
+    """Details button on notifications from before the topic card existed."""
+    row, error = load_action(conn, action_id, "details")
+    if error:
+        answer_callback(callback["id"], error)
+        return
+    answer_callback(callback["id"])
+    message = callback.get("message") or {}
+    markup = {"inline_keyboard": [[{"text": "🌐 Open in UiTM", "url": row["topic_url"]}]]} if row["topic_url"] else None
+    send_message(message["chat"]["id"], build_details_text(row), reply_markup=markup,
+                 reply_to_message_id=message.get("message_id"))
+
+
+# ---- drafts -------------------------------------------------------------------
+
+def draft_json(row, column):
+    try:
+        value = json.loads(row[column] or "[]")
+    except (TypeError, ValueError, IndexError, KeyError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def target_from_post(post, is_root):
+    s = scraper()
+    who = s.short_person(post.get("author"))
+    excerpt = truncate_text(post.get("content_excerpt") or "", 28)
+    label = f"📌 Original post · {who}" if is_root else (f"{who} · {excerpt}" if excerpt else who)
+    return {
+        "post_id": post.get("post_id"),
+        "author": post.get("author") or "Unknown",
+        "excerpt": truncate_text(post.get("content_excerpt") or "", 500),
+        "posted_time": post.get("posted_time") or "",
+        "label": truncate_text(label, 60),
+        "is_root": is_root,
+    }
+
+
+def topic_reply_targets(conn, topic_id):
+    s = scraper()
+    topic = {"topic_id": topic_id}
+    posts = s.annotate_topic_posts(topic, s.get_current_post_state(conn, [topic_id]))
+    root = s.topic_root_post(posts)
+    targets = []
+    if root and root.get("replyable") and not root.get("is_own"):
+        targets.append(target_from_post(root, True))
+    for post in reversed(posts):
+        if len(targets) >= MAX_REPLY_TARGETS:
+            break
+        if post is root or not post.get("replyable") or post.get("is_own"):
+            continue
+        targets.append(target_from_post(post, False))
+    return targets
+
+
+def topic_row(conn, topic_id):
+    return conn.execute('''SELECT topic_id, topic_title, topic_url, course_code, week_title FROM topics
+                           WHERE topic_id = ? ORDER BY last_updated DESC LIMIT 1''', (topic_id,)).fetchone()
+
+
+def create_draft(conn, chat_id, user_id, topic_id, state, *, target=None, text="", attachments=None,
+                 targets=None, topic_choices=None, message_id=None):
+    topic = topic_row(conn, topic_id) if topic_id else None
+    now = datetime.now()
+    pending_id = secrets.token_urlsafe(8)
+    conn.execute('''INSERT INTO telegram_pending_replies
+                    (id, chat_id, user_id, topic_id, post_id, topic_url, source_action_id, target_post_id,
+                     target_author, target_excerpt, target_posted_time, target_label, topic_title, draft_text,
+                     state, created_at, updated_at, expires_at, attachments_json, preview_message_id,
+                     origin_message_id, targets_json, topic_choices_json)
+                    VALUES (?, ?, ?, ?, '', ?, '', '', '', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (pending_id, str(chat_id), str(user_id), topic_id or "",
+                  topic["topic_url"] if topic else "", topic["topic_title"] if topic else "", text or "",
+                  state, now.isoformat(), now.isoformat(),
+                  (now + timedelta(hours=max(1, REPLY_DRAFT_TTL_HOURS))).isoformat(),
+                  json.dumps(attachments or []), str(message_id) if message_id else None,
+                  str(message_id) if message_id else None, json.dumps(targets or []), json.dumps(topic_choices or [])))
+    conn.commit()
+    if target:
+        set_draft_target(conn, pending_id, target)
+    return pending_id
+
+
+def set_draft_target(conn, pending_id, target):
+    conn.execute('''UPDATE telegram_pending_replies
+                    SET target_post_id = ?, target_author = ?, target_excerpt = ?, target_posted_time = ?,
+                        target_label = ?, updated_at = ?
+                    WHERE id = ?''',
+                 (target["post_id"], target["author"], target["excerpt"], target["posted_time"],
+                  target["label"], datetime.now().isoformat(), pending_id))
+    conn.commit()
+
+
+def set_draft_fields(conn, pending_id, **fields):
+    fields["updated_at"] = datetime.now().isoformat()
+    assignments = ", ".join(f"{column} = ?" for column in fields)
+    conn.execute(f"UPDATE telegram_pending_replies SET {assignments} WHERE id = ?", [*fields.values(), pending_id])
+    conn.commit()
+
+
+def latest_open_reply(conn, chat_id, user_id):
+    marks = ",".join("?" for _ in OPEN_DRAFT_STATES)
+    return conn.execute(f'''SELECT * FROM telegram_pending_replies
+                            WHERE chat_id = ? AND user_id = ? AND state IN ({marks}) AND expires_at >= ?
+                            ORDER BY updated_at DESC LIMIT 1''',
+                        (str(chat_id), str(user_id), *OPEN_DRAFT_STATES, datetime.now().isoformat())).fetchone()
+
+
+def latest_pending_reply(conn, chat_id, user_id):
+    row = latest_open_reply(conn, chat_id, user_id)
+    return row if row and row["state"] == "awaiting_text" else None
+
+
+def draft_heading(row):
+    return f"<b>{html_text(row['topic_title'] or 'Forum topic')}</b>"
+
+
+def target_line(row):
+    s = scraper()
+    if not row["target_post_id"]:
+        return ""
+    who = s.short_person(row["target_author"])
+    label = row["target_label"] or ""
+    prefix = "📌 " if label.startswith("📌") else ""
+    excerpt = truncate_text(row["target_excerpt"] or "", 70)
+    return f"↪️ {prefix}<b>{html_text(who)}</b>" + (f': "{html_text(excerpt)}"' if excerpt else "")
+
+
+def picker_view(row):
+    targets = draft_json(row, "targets_json")
+    lines = [f"✍️ Reply · {draft_heading(row)}", "Who are you replying to?"]
+    if (row["draft_text"] or "").strip():
+        lines += ["", f"<i>{html_text(truncate_text(row['draft_text'], 120))}</i>"]
+    rows = [[{"text": target["label"], "callback_data": f"pt:{row['id']}:{index}"}] for index, target in enumerate(targets)]
+    rows.append([{"text": "✖ Cancel", "callback_data": f"c:{row['id']}"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def topic_choice_view(row):
+    choices = draft_json(row, "topic_choices_json")
+    lines = ["✍️ Which topic is your reply for?"]
+    if (row["draft_text"] or "").strip():
+        lines += ["", f"<i>{html_text(truncate_text(row['draft_text'], 120))}</i>"]
+    rows = [[{"text": choice["label"], "callback_data": f"pc:{row['id']}:{index}"}] for index, choice in enumerate(choices)]
+    rows.append([{"text": "✖ Cancel", "callback_data": f"c:{row['id']}"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def prompt_view(row):
+    lines = [f"✍️ Reply · {draft_heading(row)}", target_line(row), "",
+             "Type your message below, or swipe-reply to this message. Send files to attach them."]
+    rows = [[
+        {"text": "🎯 Change", "callback_data": f"pg:{row['id']}"},
+        {"text": "✖ Cancel", "callback_data": f"c:{row['id']}"},
+    ]]
+    return "\n".join(line for line in lines if line is not None), {"inline_keyboard": rows}
+
+
+def preview_view(row):
+    files = draft_attachments(row)
+    text = (row["draft_text"] or "").strip()
+    lines = [f"✍️ Reply preview · {draft_heading(row)}", target_line(row), ""]
+    lines.append(html_text(text) if text else "<i>(no text yet: type your message)</i>")
+    if files:
+        lines.append(f"📎 {html_text(', '.join(item.get('name') or 'file' for item in files))}")
+    if not POST_REPLIES_ENABLED:
+        lines += ["", "<i>Posting to UiTM is turned off (UFUTURE_REPLY_ENABLED=false).</i>"]
+    second = [{"text": "🎯 Change target", "callback_data": f"pg:{row['id']}"}]
+    if files:
+        second.append({"text": "🗑 Remove files", "callback_data": f"rf:{row['id']}"})
+    rows = [
+        [{"text": "📤 Send to UiTM", "callback_data": f"p:{row['id']}"}, {"text": "✏️ Edit text", "callback_data": f"e:{row['id']}"}],
+        second,
+        [{"text": "💾 Save", "callback_data": f"s:{row['id']}"}, {"text": "✖ Cancel", "callback_data": f"c:{row['id']}"}],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def delete_message(chat_id, message_id):
+    if message_id:
+        telegram_post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+
+def release_origin(conn, row):
+    """The draft started by editing a notification or list message; put it back before moving on."""
+    origin = row["origin_message_id"]
+    if not origin:
+        return
+    chat_id = row["chat_id"]
+    stored = conn.execute("SELECT text, reply_markup_json FROM telegram_messages WHERE chat_id = ? AND message_id = ?",
+                          (str(chat_id), str(origin))).fetchone()
+    clear_card_topic(conn, chat_id, origin)
+    if stored:
+        markup = json.loads(stored["reply_markup_json"]) if stored["reply_markup_json"] else None
+        edit_message(chat_id, origin, stored["text"], markup)
+    else:
+        edit_message(chat_id, origin, "✍️ Reply draft continues below ↓")
+    set_draft_fields(conn, row["id"], origin_message_id=None)
+
+
+def show_draft_at_bottom(conn, pending_id, view=preview_view):
+    """Replace the draft message with a fresh one at the bottom of the chat."""
+    row = load_pending(conn, pending_id)
+    if row["origin_message_id"] and row["origin_message_id"] == row["preview_message_id"]:
+        release_origin(conn, row)
+    elif row["preview_message_id"]:
+        delete_message(row["chat_id"], row["preview_message_id"])
+    text, markup = view(load_pending(conn, pending_id))
+    sent = send_message(row["chat_id"], text, reply_markup=markup) or {}
+    message_id = (sent.get("result") or {}).get("message_id")
+    set_draft_fields(conn, pending_id, preview_message_id=str(message_id) if message_id else None)
+
+
+def show_draft_in_place(conn, callback, pending_id, view=preview_view):
+    message = callback.get("message") or {}
+    text, markup = view(load_pending(conn, pending_id))
+    edit_message(message["chat"]["id"], message["message_id"], text, markup)
+    set_draft_fields(conn, pending_id, preview_message_id=str(message["message_id"]))
+
+
+def open_draft_or_error(conn, callback, pending_id, states=OPEN_DRAFT_STATES):
+    row = load_pending(conn, pending_id)
+    if not row or row["state"] not in states:
+        answer_callback(callback["id"], "This draft is closed or expired.")
+        return None
+    return row
+
+
+# ---- starting a reply -----------------------------------------------------------
+
+def start_reply_for_topic(conn, callback, topic_id):
+    message = callback.get("message") or {}
+    chat_id, message_id = message["chat"]["id"], message.get("message_id")
+    targets = topic_reply_targets(conn, topic_id) if topic_id else []
+    if not targets:
+        answer_callback(callback["id"], "No post to reply to in this topic yet.")
+        return
+    user_id = (callback.get("from") or {}).get("id")
+    pending_id = create_draft(conn, chat_id, user_id, topic_id, "choosing_target", targets=targets, message_id=message_id)
+    answer_callback(callback["id"])
+    set_card_topic(conn, chat_id, message_id, topic_id)
+    show_draft_in_place(conn, callback, pending_id, picker_view)
+
+
+def handle_reply_start(conn, callback, action_id):
+    """Reply button on notifications/cards from earlier versions."""
+    start_reply_for_topic(conn, callback, legacy_topic_id(conn, action_id))
+
+
+def handle_pick_target(conn, callback, identifier):
+    pending_id, _, index = identifier.partition(":")
+    row = open_draft_or_error(conn, callback, pending_id, ("choosing_target",))
+    if not row:
+        return
+    targets = draft_json(row, "targets_json")
+    if not index.isdigit() or int(index) >= len(targets):
+        answer_callback(callback["id"], "That post is no longer available.")
+        return
+    set_draft_target(conn, pending_id, targets[int(index)])
+    answer_callback(callback["id"])
+    if (row["draft_text"] or "").strip() or draft_attachments(row):
+        update_pending_preview(conn, pending_id, load_pending(conn, pending_id), row["draft_text"] or "")
+        show_draft_in_place(conn, callback, pending_id, preview_view)
+    else:
+        set_draft_fields(conn, pending_id, state="awaiting_text")
+        show_draft_in_place(conn, callback, pending_id, prompt_view)
+
+
+def handle_change_target(conn, callback, pending_id):
+    row = open_draft_or_error(conn, callback, pending_id, ("awaiting_text", "preview"))
+    if not row:
+        return
+    targets = topic_reply_targets(conn, row["topic_id"])
+    if not targets:
+        answer_callback(callback["id"], "No other post to reply to.")
+        return
+    set_draft_fields(conn, pending_id, state="choosing_target", targets_json=json.dumps(targets))
+    answer_callback(callback["id"])
+    show_draft_in_place(conn, callback, pending_id, picker_view)
+
+
+def handle_pick_topic(conn, callback, identifier):
+    pending_id, _, index = identifier.partition(":")
+    row = open_draft_or_error(conn, callback, pending_id, ("choosing_topic",))
+    if not row:
+        return
+    choices = draft_json(row, "topic_choices_json")
+    if not index.isdigit() or int(index) >= len(choices):
+        answer_callback(callback["id"], "That topic is no longer available.")
+        return
+    choice = choices[int(index)]
+    topic = topic_row(conn, choice["topic_id"])
+    targets = topic_reply_targets(conn, choice["topic_id"])
+    target = next((item for item in targets if item["post_id"] == choice.get("target_post_id")), None) or (targets[0] if targets else None)
+    if not topic or not target:
+        answer_callback(callback["id"], "No post to reply to in that topic.")
+        return
+    set_draft_fields(conn, pending_id, topic_id=choice["topic_id"], topic_url=topic["topic_url"],
+                     topic_title=topic["topic_title"], targets_json=json.dumps(targets))
+    set_draft_target(conn, pending_id, target)
+    update_pending_preview(conn, pending_id, load_pending(conn, pending_id), row["draft_text"] or "")
+    answer_callback(callback["id"])
+    show_draft_in_place(conn, callback, pending_id, preview_view)
+
+
+def start_swipe_reply(conn, message, mapped, text, item):
+    """A reply (swipe) to a notification, card or list message starts a draft for that topic."""
+    s = scraper()
+    chat_id, user_id = message["chat"]["id"], (message.get("from") or {}).get("id")
+    attachments = [item] if item else []
+    if len(mapped) == 1:
+        topic_id = mapped[0]["topic_id"]
+        targets = topic_reply_targets(conn, topic_id)
+        target = next((t for t in targets if t["post_id"] == mapped[0]["target_post_id"]), None) or (targets[0] if targets else None)
+        if not target:
+            send_message(chat_id, "There's no post to reply to in that topic.", reply_to_message_id=message.get("message_id"))
+            return
+        pending_id = create_draft(conn, chat_id, user_id, topic_id, "preview", target=target, text=text,
+                                  attachments=attachments, targets=targets)
+        update_pending_preview(conn, pending_id, load_pending(conn, pending_id), text, attachments)
+        show_draft_at_bottom(conn, pending_id, preview_view)
+        return
+    choices = []
+    for entry in mapped:
+        topic = topic_row(conn, entry["topic_id"])
+        if topic:
+            label = f"{topic['course_code']} {s.short_week(topic['week_title'])} · {topic['topic_title']}"
+            choices.append({"topic_id": entry["topic_id"], "target_post_id": entry["target_post_id"], "label": truncate_text(label, 60)})
+    if not choices:
+        send_message(chat_id, "Those topics are no longer stored.", reply_to_message_id=message.get("message_id"))
+        return
+    pending_id = create_draft(conn, chat_id, user_id, "", "choosing_topic", text=text, attachments=attachments,
+                              topic_choices=choices)
+    show_draft_at_bottom(conn, pending_id, topic_choice_view)
+
+
+# ---- draft edits ----------------------------------------------------------------
+
+def add_text_to_draft(conn, row, text):
+    if row["state"] in ("choosing_target", "choosing_topic"):
+        set_draft_fields(conn, row["id"], draft_text=text)
+        view = picker_view if row["state"] == "choosing_target" else topic_choice_view
+        show_draft_at_bottom(conn, row["id"], view)
+        return
+    update_pending_preview(conn, row["id"], row, text)
+    show_draft_at_bottom(conn, row["id"], preview_view)
+
+
+def handle_draft_file(conn, chat_id, message, pending, item):
+    reply_to = message.get("message_id")
+    attachments = draft_attachments(pending)
+    if item["size"] > TELEGRAM_DOWNLOAD_MAX_BYTES:
+        send_message(chat_id, f"📎 {html_text(item['name'])} is over 20 MB, the largest file a Telegram bot can download.", reply_to_message_id=reply_to)
+        return
+    if len(attachments) >= REPLY_MAX_FILES:
+        send_message(chat_id, f"A reply can have at most {REPLY_MAX_FILES} files.", reply_to_message_id=reply_to)
+        return
+    if all(existing.get("file_unique_id") != item["file_unique_id"] for existing in attachments):
+        attachments.append(item)
+    draft_text = (message.get("caption") or "").strip() or pending["draft_text"] or ""
+    if pending["state"] in ("choosing_target", "choosing_topic"):
+        set_draft_fields(conn, pending["id"], draft_text=draft_text, attachments_json=json.dumps(attachments))
+        show_draft_at_bottom(conn, pending["id"], picker_view if pending["state"] == "choosing_target" else topic_choice_view)
+        return
+    update_pending_preview(conn, pending["id"], pending, draft_text, attachments)
+    show_draft_at_bottom(conn, pending["id"], preview_view)
+
+
+def handle_remove_files(conn, callback, pending_id):
+    row = open_draft_or_error(conn, callback, pending_id, ("preview", "awaiting_text"))
+    if not row:
+        return
+    update_pending_preview(conn, pending_id, row, row["draft_text"] or "", [])
+    answer_callback(callback["id"], "Files removed.")
+    show_draft_in_place(conn, callback, pending_id, preview_view)
+
+
+def handle_edit_draft(conn, callback, pending_id):
+    row = open_draft_or_error(conn, callback, pending_id, ("preview",))
+    if not row:
+        return
+    set_draft_fields(conn, pending_id, state="awaiting_text")
+    answer_callback(callback["id"])
+    message = callback["message"]
+    edit_message(message["chat"]["id"], message["message_id"],
+                 f"✏️ Send the new text for your reply · {draft_heading(row)}\n{target_line(row)}",
+                 {"inline_keyboard": [[{"text": "✖ Cancel", "callback_data": f"c:{pending_id}"}]]})
+
+
+def close_draft_message(conn, callback, row, text, markup=None):
+    """Finish the draft message; if it is still the original notification, restore that instead."""
+    message = callback.get("message") or {}
+    if row["origin_message_id"] and str(row["origin_message_id"]) == str(message.get("message_id")):
+        release_origin(conn, row)
+        return
+    edit_message(message["chat"]["id"], message["message_id"], text, markup)
+
+
+def handle_save_draft(conn, callback, pending_id):
+    row = open_draft_or_error(conn, callback, pending_id, ("preview", "awaiting_text"))
+    if not row:
+        return
+    set_draft_fields(conn, pending_id, state="saved",
+                     expires_at=(datetime.now() + timedelta(days=SAVED_DRAFT_TTL_DAYS)).isoformat())
+    answer_callback(callback["id"], "Draft saved.")
+    close_draft_message(conn, callback, row, f"💾 Draft saved · {draft_heading(row)}\nUse /drafts to continue it.")
+
+
+def handle_cancel(conn, callback, pending_id):
+    row = load_pending(conn, pending_id)
+    if row and row["state"] in OPEN_DRAFT_STATES + ("saved",):
+        update_pending_state(conn, pending_id, "cancelled")
+        answer_callback(callback["id"], "Cancelled.")
+        close_draft_message(conn, callback, row, "✖ Reply cancelled.")
+        return
+    answer_callback(callback["id"], "Cancelled.")
+
+
+def render_drafts(conn, chat_id):
+    s = scraper()
+    rows = conn.execute('''SELECT * FROM telegram_pending_replies
+                           WHERE chat_id = ? AND state = 'saved' AND expires_at >= ?
+                           ORDER BY updated_at DESC LIMIT 10''', (str(chat_id), datetime.now().isoformat())).fetchall()
+    if not rows:
+        return "No saved drafts.", None
+    lines = ["💾 <b>Saved drafts</b>", ""]
+    buttons = []
+    for index, row in enumerate(rows, start=1):
+        lines.append(f"{index}. {html_text(row['topic_title'])} → {html_text(s.short_person(row['target_author']))}")
+        lines.append(f"   <i>{html_text(truncate_text(row['draft_text'] or '(no text)', 80))}</i>")
+        buttons.append({"text": f"Open {index}", "callback_data": f"dr:{row['id']}"})
+    return "\n".join(lines), {"inline_keyboard": button_rows(buttons, 4)}
+
+
+def handle_resume_draft(conn, callback, pending_id):
+    row = load_pending(conn, pending_id)
+    if not row or row["state"] != "saved":
+        answer_callback(callback["id"], "That draft is no longer saved.")
+        return
+    set_draft_fields(conn, pending_id, state="preview", preview_message_id=None, origin_message_id=None,
+                     expires_at=(datetime.now() + timedelta(hours=max(1, REPLY_DRAFT_TTL_HOURS))).isoformat())
+    answer_callback(callback["id"])
+    show_draft_at_bottom(conn, pending_id, preview_view)
+
+
+# ---- routing ----------------------------------------------------------------------
+
 def handle_callback(conn, callback):
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -1552,29 +1717,36 @@ def handle_callback(conn, callback):
         return
     prefix, identifier = data.split(":", 1)
     if prefix in NAVIGATION_RENDERERS:
+        clear_card_topic(conn, chat_id, message.get("message_id"))
         handle_navigation(conn, callback, prefix, identifier)
-    elif prefix == "f":
-        handle_send_file(conn, callback, identifier)
-    elif prefix == "rf":
-        handle_remove_files(conn, callback, identifier)
-    elif prefix in {"mu", "um"}:
-        handle_mute_button(conn, callback, identifier, prefix == "mu")
-    elif prefix == "o":
-        handle_open_card(conn, callback, identifier)
-    elif prefix == "cd":
-        handle_card_details(conn, callback, identifier)
+    elif prefix in {"ot", "od", "of"}:
+        handle_topic_view(conn, callback, prefix, identifier)
+    elif prefix == "or":
+        start_reply_for_topic(conn, callback, identifier)
+    elif prefix in {"o", "cd", "tf"}:  # cards from earlier versions (action ids)
+        handle_topic_view(conn, callback, {"o": "ot", "cd": "od", "tf": "of"}[prefix], legacy_topic_id(conn, identifier) or "")
     elif prefix == "bm":
         handle_back_to_message(conn, callback)
+    elif prefix == "f":
+        handle_send_file(conn, callback, identifier)
+    elif prefix in {"mu", "um"}:
+        handle_mute_button(conn, callback, identifier, prefix == "mu")
+    elif prefix == "pt":
+        handle_pick_target(conn, callback, identifier)
+    elif prefix == "pc":
+        handle_pick_topic(conn, callback, identifier)
+    elif prefix == "pg":
+        handle_change_target(conn, callback, identifier)
+    elif prefix == "dr":
+        handle_resume_draft(conn, callback, identifier)
+    elif prefix == "rf":
+        handle_remove_files(conn, callback, identifier)
     elif prefix == "d":
         handle_details(conn, callback, identifier)
     elif prefix == "r":
         handle_reply_start(conn, callback, identifier)
     elif prefix == "t":
-        parts = identifier.split(":", 1)
-        if len(parts) != 2:
-            answer_callback(callback["id"], "Invalid target.")
-            return
-        handle_reply_target(conn, callback, parts[0], parts[1])
+        handle_legacy_target(conn, callback, identifier)
     elif prefix == "p":
         handle_send_reply(conn, callback, identifier)
     elif prefix == "e":
@@ -1587,6 +1759,12 @@ def handle_callback(conn, callback):
         answer_callback(callback["id"], "Cancelled.")
     else:
         answer_callback(callback["id"], "Unknown action.")
+
+
+def handle_legacy_target(conn, callback, identifier):
+    """Target buttons from the old picker message: restart the new picker for that topic."""
+    action_id, _, _ = identifier.partition(":")
+    start_reply_for_topic(conn, callback, legacy_topic_id(conn, action_id))
 
 
 def handle_message(conn, message):
@@ -1602,17 +1780,6 @@ def handle_message(conn, message):
     incoming_file = telegram_file_from_message(message)
     if not text and not incoming_file:
         return
-    if incoming_file:
-        pending = latest_open_reply(conn, chat_id, user_id)
-        if not pending:
-            send_message(
-                chat_id,
-                "To attach a file to a forum reply, tap ✍️ Reply on a topic first, then send the file.",
-                reply_to_message_id=message.get("message_id"),
-            )
-            return
-        handle_draft_file(conn, chat_id, message, pending, incoming_file)
-        return
     if text.startswith("/"):
         command, _, argument = text[1:].partition(" ")
         command = command.split("@", 1)[0].lower()
@@ -1620,30 +1787,44 @@ def handle_message(conn, message):
             pending = latest_open_reply(conn, chat_id, user_id)
             if pending:
                 update_pending_state(conn, pending["id"], "cancelled")
+                if pending["origin_message_id"]:
+                    release_origin(conn, pending)
+                elif pending["preview_message_id"]:
+                    edit_message(chat_id, pending["preview_message_id"], "✖ Reply cancelled.")
                 send_message(chat_id, "Reply draft cancelled.", reply_to_message_id=message.get("message_id"))
             else:
                 send_message(chat_id, "Nothing to cancel.", reply_to_message_id=message.get("message_id"))
             return
+        if command == "drafts":
+            show(chat_id, None, *render_drafts(conn, chat_id))
+            return
         handle_command(conn, chat_id, command, argument.strip())
         return
+
     pending = latest_open_reply(conn, chat_id, user_id)
-    # Text fills the draft while it is awaiting text, or a preview that only has files so far.
-    if pending and (pending["state"] == "awaiting_text" or not (pending["draft_text"] or "").strip()):
-        update_pending_preview(conn, pending["id"], pending, text)
-        send_preview(conn, chat_id, pending["id"], message.get("message_id"))
+    reply_to = (message.get("reply_to_message") or {}).get("message_id")
+    if reply_to:
+        is_draft_message = pending and str(reply_to) in {str(pending["preview_message_id"]), str(pending["origin_message_id"])}
+        mapped = [] if is_draft_message else message_topics(conn, chat_id, reply_to)
+        if mapped:
+            start_swipe_reply(conn, message, mapped, text or (message.get("caption") or "").strip(), incoming_file)
+            return
+    if incoming_file:
+        if not pending:
+            send_message(chat_id, "To attach a file to a forum reply, swipe-reply to a topic message or tap ✍️ Reply first.",
+                         reply_to_message_id=message.get("message_id"))
+            return
+        handle_draft_file(conn, chat_id, message, pending, incoming_file)
+        return
+    if pending and (pending["state"] != "preview" or not (pending["draft_text"] or "").strip()):
+        add_text_to_draft(conn, pending, text)
         return
     if pending:
-        send_message(
-            chat_id,
-            "Your reply is in the preview above. Tap ✏️ Edit text to change it, or send a file to attach it.",
-            reply_to_message_id=message.get("message_id"),
-        )
+        send_message(chat_id, "Your reply is in the preview above. Tap ✏️ Edit text to change it, or send a file to attach it.",
+                     reply_to_message_id=message.get("message_id"))
         return
-    send_message(
-        chat_id,
-        "No reply draft is open. Tap ✍️ Reply on a topic to start one, or see /help.",
-        reply_to_message_id=message.get("message_id"),
-    )
+    send_message(chat_id, "To reply on the forum, swipe-reply to a topic message, or tap ▸ then ✍️ Reply. See /help.",
+                 reply_to_message_id=message.get("message_id"))
 
 
 def poll_updates(conn):
