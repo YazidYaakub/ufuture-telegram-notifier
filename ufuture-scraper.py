@@ -1170,6 +1170,11 @@ def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_pos
         "latest_post": next((post for post in reversed(topic_posts) if not post.get("is_own")), None),
         "root_post": root_post,
         "detail_posts": display_posts[-10:],
+        # Whole thread in time order, including the user's own posts, for the Details view.
+        "thread_posts": [
+            post for post in topic_posts
+            if not root_post or post.get("post_id") != root_post.get("post_id")
+        ][-10:],
         "reply_targets": topic_reply_targets(topic_posts, root_post),
         "media_url": media_post.get("media_url", "") if media_post else "",
         "media_label": media_post.get("media_label", "") if media_post else "",
@@ -1205,11 +1210,13 @@ def attach_topic_details(changes, current_topics, current_posts, detail_history)
         week_topics = topics_by_week.get((change["course_code"], change["week"]), [])
         details = []
         own_new_count = 0
+        all_topics_exact = bool(week_topics)
 
         for topic in week_topics:
             topic_posts = annotate_topic_posts(topic, posts_by_topic.get(topic["topic_id"], []))
             previous_post_ids = last_post_ids_by_topic.get(topic["topic_id"], set())
             has_post_history = bool(previous_post_ids)
+            all_topics_exact = all_topics_exact and has_detail_history and has_post_history
             is_new_topic = (
                 has_detail_history
                 and change.get("new_topics", 0) > 0
@@ -1250,8 +1257,9 @@ def attach_topic_details(changes, current_topics, current_posts, detail_history)
                 summary_posts=summary_posts,
             ))
 
-        if not details and own_new_count:
-            # Every new post in this week was written by the logged-in user.
+        if not details and (own_new_count or all_topics_exact):
+            # Every new post was written by the logged-in user, or (e.g. after the bot stored
+            # a reply it just posted) every topic was compared exactly and nothing is new.
             change["own_only"] = True
             continue
 

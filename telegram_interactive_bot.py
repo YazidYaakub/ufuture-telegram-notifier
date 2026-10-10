@@ -362,11 +362,13 @@ def build_details_text(row):
             lines.append(html_text(root_post.get("posted_time")))
 
     root_post_id = root_post.get("post_id") if root_post else None
-    reply_posts = [post for post in posts if post.get("post_id") != root_post_id]
+    thread = topic.get("thread_posts")
+    reply_posts = thread if thread is not None else [post for post in posts if post.get("post_id") != root_post_id]
     if reply_posts:
-        lines.extend(["", "<b>New/latest replies</b>"])
+        lines.extend(["", "<b>Latest replies</b>" if thread is not None else "<b>New/latest replies</b>"])
         for index, post in enumerate(reply_posts[:10], start=1):
-            lines.append(f"{index}. {html_text(post.get('author') or 'Unknown')}")
+            author = "🙋 You" if post.get("is_own") else html_text(post.get("author") or "Unknown")
+            lines.append(f"{index}. {author}")
             if post.get("content_excerpt"):
                 lines.append(f"   {html_text(post.get('content_excerpt'))}")
             if post.get("posted_time"):
@@ -892,11 +894,25 @@ def submit_reply_to_ufuture(row):
     if not posted:
         if rejected:
             return {"status": "not_sent", "message": f"UiTM rejected the reply (HTTP {response.status_code})"}
-        return {"status": "unverified", "message": "the reply did not appear on the topic page"}
+        return {"status": "unverified", "message": "the reply did not appear on the topic page", "posts": posts}
     message = "Posted to UiTM."
     if len(posted.get("attachments") or []) < len(files):
         message += f" Only {len(posted.get('attachments') or [])} of {len(files)} file(s) appear on the post."
-    return {"status": "posted", "message": message}
+    return {"status": "posted", "message": message, "posts": posts}
+
+
+def refresh_topic_in_db(conn, row, posts):
+    """Store the topic as just re-read after posting, so the bot shows the new reply right away."""
+    s = scraper()
+    topic = conn.execute(
+        "SELECT * FROM topics WHERE topic_id = ? ORDER BY last_updated DESC LIMIT 1", (row["topic_id"],)
+    ).fetchone()
+    if not topic or not posts:
+        return
+    topic_row = {key: topic[key] for key in topic.keys()}
+    topic_row["week"] = topic_row["week_title"]
+    topic_row["replies"] = max(0, len(posts) - 1)
+    s.save_to_db(conn, [], {}, [topic_row], posts)
 
 
 def reply_rate_limited(conn):
@@ -970,6 +986,10 @@ def handle_send_reply(conn, callback, pending_id):
     files = draft_attachments(row)
     if result["status"] == "posted":
         update_pending_result(conn, pending_id, "posted", result["message"])
+        try:
+            refresh_topic_in_db(conn, row, result.get("posts"))
+        except Exception as error:
+            print(f"Topic refresh after posting failed: {type(error).__name__}")
         set_state(conn, "last_reply_posted_at", datetime.now().isoformat())
         lines = [f"✅ <b>Posted to UiTM</b> · {html_text(row['topic_title'])}", f"Reply to {html_text(row['target_label'] or 'selected post')}"]
         if files:
