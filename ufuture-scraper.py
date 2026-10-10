@@ -4,7 +4,7 @@ Uses environment variables for credentials
 """
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 import re
 import socket
 import time
@@ -15,6 +15,7 @@ import os
 import sys
 import html
 import hashlib
+import io
 import secrets
 from requests import RequestException
 
@@ -64,6 +65,10 @@ UFUTURE_POST_REPLIES = os.getenv("UFUTURE_POST_REPLIES", "false").strip().lower(
 TOPIC_DETAIL_MODE = os.getenv("TOPIC_DETAIL_MODE", "changed").strip().lower()
 TELEGRAM_SILENT_CLASSMATE_REPLIES = os.getenv("TELEGRAM_SILENT_CLASSMATE_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_SEND_ATTACHMENTS = os.getenv("TELEGRAM_SEND_ATTACHMENTS", "true").strip().lower() in {"1", "true", "yes", "on"}
+ATTACHMENT_MAX_MB = float(os.getenv("ATTACHMENT_MAX_MB", "20"))
+ATTACHMENT_MAX_PER_RUN = int(os.getenv("ATTACHMENT_MAX_PER_RUN", "5"))
+ATTACHMENT_MAX_ATTEMPTS = 3
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -245,6 +250,26 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
         value TEXT
+    )''')
+
+    # Attachments waiting to be relayed to Telegram. Files are never stored;
+    # only the Telegram file_id is kept once sent.
+    c.execute('''CREATE TABLE IF NOT EXISTS attachment_queue (
+        url TEXT PRIMARY KEY,
+        label TEXT,
+        course_code TEXT,
+        topic_id TEXT,
+        topic_title TEXT,
+        post_id TEXT,
+        reply_to_message_id TEXT,
+        silent INTEGER DEFAULT 0,
+        status TEXT NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        size_bytes INTEGER,
+        telegram_file_id TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     )''')
     
     conn.commit()
@@ -1101,7 +1126,8 @@ def annotate_topic_posts(topic, topic_posts):
     ]
 
 
-def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_post_diff, display_posts):
+def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_post_diff, display_posts,
+                       summary_posts=None):
     root_post = topic_root_post(topic_posts)
     media_post = next((post for post in topic_posts if post.get("media_url")), None)
     important = (
@@ -1122,13 +1148,19 @@ def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_pos
         "new_posts": len(new_posts),
         "replied_to_me": sum(1 for post in new_posts if post.get("to_me")),
         "important": important,
-        "posts": display_posts[-3:],
+        "posts": (summary_posts or display_posts)[-3:],
         "root_post": root_post,
         "detail_posts": display_posts[-10:],
         "reply_targets": topic_reply_targets(topic_posts, root_post),
         "media_url": media_post.get("media_url", "") if media_post else "",
         "media_label": media_post.get("media_label", "") if media_post else "",
         "exact_post_diff": exact_post_diff,
+        # Only attachments from posts known to be new; guessed diffs could resend old files.
+        "new_attachments": [
+            dict(attachment, post_id=post.get("post_id"))
+            for post in new_posts
+            for attachment in post.get("attachments") or []
+        ] if (exact_post_diff or is_new_topic) else [],
     }
 
 
@@ -1185,11 +1217,18 @@ def attach_topic_details(changes, current_topics, current_posts, detail_history)
                 continue
 
             others = [post for post in topic_posts if not post.get("is_own")]
+            summary_posts = None
+            root_post = topic_root_post(topic_posts)
+            if is_new_topic and root_post and not root_post.get("is_own"):
+                # Lead a new topic with its original post, even if replies already exist.
+                replies = [post for post in new_posts if post.get("post_id") != root_post.get("post_id")]
+                summary_posts = [root_post] + replies[-2:]
             details.append(build_topic_detail(
                 topic, topic_posts, new_posts,
                 is_new_topic=is_new_topic,
                 exact_post_diff=exact_post_diff,
                 display_posts=new_posts or others[-2:],
+                summary_posts=summary_posts,
             ))
 
         if not details and own_new_count:
@@ -1468,7 +1507,7 @@ def chunk_telegram_text_blocks(blocks):
 def build_telegram_payloads(changes, conn=None):
     if TELEGRAM_INLINE_BUTTONS:
         payloads = []
-        for change in changes:
+        for change_index, change in enumerate(changes):
             block = build_change_block(change, number_topics=True)
             text = "\n\n".join([
                 "🔔 <b>Forum Updates Detected!</b>",
@@ -1478,7 +1517,7 @@ def build_telegram_payloads(changes, conn=None):
             keyboard = build_inline_keyboard(change, conn)
             silent = bool(change.get("silent"))
             if len(text) <= 3900:
-                payload = {"text": text, "disable_notification": silent}
+                payload = {"text": text, "disable_notification": silent, "change_indexes": [change_index]}
                 if keyboard:
                     payload["reply_markup"] = keyboard
                 payloads.append(payload)
@@ -1486,16 +1525,17 @@ def build_telegram_payloads(changes, conn=None):
 
             chunks = chunk_telegram_text_blocks([block])
             for index, chunk in enumerate(chunks):
-                payload = {"text": chunk, "disable_notification": silent}
+                payload = {"text": chunk, "disable_notification": silent, "change_indexes": [change_index]}
                 if index == 0 and keyboard:
                     payload["reply_markup"] = keyboard
                 payloads.append(payload)
         return payloads
 
     silent = all(change.get("silent") for change in changes)
-    return [{"text": message, "disable_notification": silent} for message in chunk_telegram_text_blocks(
-        [build_change_block(change) for change in changes]
-    )]
+    return [
+        {"text": message, "disable_notification": silent, "change_indexes": list(range(len(changes)))}
+        for message in chunk_telegram_text_blocks([build_change_block(change) for change in changes])
+    ]
 
 
 def build_telegram_messages(changes):
@@ -1568,12 +1608,207 @@ def send_telegram_notification(changes, conn=None):
                             f"HTTP {response.status_code} - {response_description(response)}"
                         )
                         return False
+            message_id = telegram_message_id(response)
+            for change_index in payload.get("change_indexes", []):
+                # Attachments reply to the first message part of their change.
+                if message_id and not changes[change_index].get("telegram_message_id"):
+                    changes[change_index]["telegram_message_id"] = message_id
             sent += 1
         print(f"Telegram notification sent ({sent} message part(s))")
         return True
     except Exception as e:
-        print(f"Telegram notification error: {e}")
+        print(f"Telegram notification error: {redact_secrets(e)}")
         return False
+
+
+def telegram_message_id(response):
+    try:
+        return (response.json().get("result") or {}).get("message_id")
+    except (ValueError, AttributeError):
+        return None
+
+
+def redact_secrets(value):
+    text = str(value)
+    if TELEGRAM_BOT_TOKEN:
+        text = text.replace(TELEGRAM_BOT_TOKEN, "<redacted>")
+    return text
+
+# ============================================================================
+# TELEGRAM ATTACHMENTS
+# ============================================================================
+
+class AttachmentTooLarge(Exception):
+    def __init__(self, size_bytes):
+        super().__init__(f"{size_bytes} bytes")
+        self.size_bytes = size_bytes
+
+
+def format_size(size_bytes):
+    if size_bytes < 1024 * 1024:
+        return f"{max(1, round(size_bytes / 1024))} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def queue_new_attachments(conn, changes):
+    now = datetime.now().isoformat()
+    queued = 0
+    for change in changes or []:
+        for topic in change.get("topic_details") or []:
+            for attachment in topic.get("new_attachments") or []:
+                cursor = conn.execute('''INSERT OR IGNORE INTO attachment_queue
+                                         (url, label, course_code, topic_id, topic_title, post_id,
+                                          reply_to_message_id, silent, status, attempts,
+                                          created_at, updated_at)
+                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)''',
+                                      (attachment["url"], attachment.get("label") or "",
+                                       change.get("course_code", ""), topic.get("topic_id", ""),
+                                       topic.get("topic_title", ""), attachment.get("post_id") or "",
+                                       str(change.get("telegram_message_id") or ""),
+                                       1 if change.get("silent") else 0, now, now))
+                queued += cursor.rowcount
+    conn.commit()
+    if queued:
+        print(f"Queued {queued} new attachment(s) for Telegram")
+    return queued
+
+
+def update_attachment(conn, url, **fields):
+    fields["updated_at"] = datetime.now().isoformat()
+    assignments = ", ".join(f"{column} = ?" for column in fields)
+    conn.execute(f"UPDATE attachment_queue SET {assignments} WHERE url = ?", [*fields.values(), url])
+    conn.commit()
+
+
+def open_attachment(session, url):
+    response = session.get(url, stream=True, timeout=60)
+    response.raise_for_status()
+    content_type = response.headers.get("Content-Type", "")
+    if urlparse(response.url).path.rstrip("/").endswith("/login") or content_type.startswith("text/html"):
+        response.close()
+        raise ScraperError("UiTM returned a web page instead of the file (session expired?)")
+    return response
+
+
+def attachment_filename(response, fallback):
+    disposition = response.headers.get("Content-Disposition") or ""
+    match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", disposition, re.IGNORECASE)
+    name = unquote(match.group(1)).strip() if match else ""
+    return os.path.basename(name or fallback or "attachment")
+
+
+def download_attachment(response, max_bytes):
+    """Read the file into memory only; it is never written to disk."""
+    length = response.headers.get("Content-Length") or ""
+    if length.isdigit() and int(length) > max_bytes:
+        raise AttachmentTooLarge(int(length))
+    buffer = io.BytesIO()
+    for chunk in response.iter_content(64 * 1024):
+        buffer.write(chunk)
+        if buffer.tell() > max_bytes:
+            raise AttachmentTooLarge(buffer.tell())
+    buffer.seek(0)
+    return buffer
+
+
+def telegram_api(method, data, files=None, timeout=30):
+    return requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+        data=data,
+        files=files,
+        timeout=timeout,
+    )
+
+
+def attachment_reply_fields(row):
+    fields = {"chat_id": TELEGRAM_CHAT_ID, "disable_notification": bool(row["silent"])}
+    if row["reply_to_message_id"]:
+        fields["reply_parameters"] = json.dumps({
+            "message_id": int(row["reply_to_message_id"]),
+            "allow_sending_without_reply": True,
+        })
+    return fields
+
+
+def send_queued_attachments(conn, session):
+    if not TELEGRAM_SEND_ATTACHMENTS or not (TELEGRAM_ENABLED or DRY_RUN):
+        return 0
+
+    columns = ["url", "label", "course_code", "topic_title", "reply_to_message_id", "silent", "attempts"]
+    rows = [
+        dict(zip(columns, row))
+        for row in conn.execute(f'''SELECT {", ".join(columns)} FROM attachment_queue
+                                    WHERE status = 'pending' AND attempts < ?
+                                    ORDER BY created_at
+                                    LIMIT ?''',
+                                (ATTACHMENT_MAX_ATTEMPTS, max(0, ATTACHMENT_MAX_PER_RUN)))
+    ]
+    max_bytes = int(ATTACHMENT_MAX_MB * 1024 * 1024)
+    sent = 0
+
+    for index, row in enumerate(rows):
+        if index:
+            time.sleep(1)
+        label = row["label"] or media_label_from_url(row["url"])
+        try:
+            response = open_attachment(session, row["url"])
+            try:
+                filename = attachment_filename(response, label)
+                if DRY_RUN:
+                    length = response.headers.get("Content-Length") or ""
+                    size = format_size(int(length)) if length.isdigit() else "unknown size"
+                    action = "send a link (over limit)" if length.isdigit() and int(length) > max_bytes else "send file"
+                    print(f"DRY_RUN: would {action}: {filename} ({size})")
+                    continue
+                buffer = download_attachment(response, max_bytes)
+            finally:
+                response.close()
+
+            caption = truncate_text(f"📎 {label}\n{row['course_code']} · {row['topic_title']}", 1000)
+            result = telegram_api(
+                "sendDocument",
+                {**attachment_reply_fields(row), "caption": caption},
+                files={"document": (filename, buffer)},
+                timeout=120,
+            )
+            if result.status_code != 200:
+                raise ScraperError(f"Telegram sendDocument failed: HTTP {result.status_code}")
+            document = (result.json().get("result") or {}).get("document") or {}
+            update_attachment(
+                conn, row["url"],
+                status="sent", attempts=row["attempts"] + 1,
+                size_bytes=buffer.getbuffer().nbytes,
+                telegram_file_id=document.get("file_id"), last_error=None,
+            )
+            sent += 1
+            print(f"Sent attachment to Telegram: {filename} ({format_size(buffer.getbuffer().nbytes)})")
+        except AttachmentTooLarge as error:
+            text = (
+                f"📎 {label} is too large to send here "
+                f"({format_size(error.size_bytes)}, limit {ATTACHMENT_MAX_MB:g} MB). Open it in UiTM."
+            )
+            markup = json.dumps({"inline_keyboard": [[{"text": "Open in UiTM", "url": row["url"]}]]})
+            try:
+                telegram_api("sendMessage", {**attachment_reply_fields(row), "text": text, "reply_markup": markup})
+            except RequestException as send_error:
+                print(f"Too-large notice failed: {redact_secrets(send_error)}")
+            update_attachment(
+                conn, row["url"],
+                status="too_large", attempts=row["attempts"] + 1,
+                size_bytes=error.size_bytes, last_error=None,
+            )
+            print(f"Attachment too large, sent link instead: {label} ({format_size(error.size_bytes)})")
+        except (RequestException, ScraperError, ValueError) as error:
+            attempts = row["attempts"] + 1
+            message = redact_secrets(error)[:300]
+            update_attachment(
+                conn, row["url"],
+                status="failed" if attempts >= ATTACHMENT_MAX_ATTEMPTS else "pending",
+                attempts=attempts, last_error=message,
+            )
+            print(f"Attachment {label} failed (attempt {attempts}/{ATTACHMENT_MAX_ATTEMPTS}): {message}")
+
+    return sent
 
 # ============================================================================
 # MAIN
@@ -1746,6 +1981,14 @@ def run_scrape():
             print("No changes detected\n")
         else:
             print("First run - notification system ready\n")
+
+    # Relay attachments from new posts, plus any still pending from earlier runs.
+    if TELEGRAM_SEND_ATTACHMENTS:
+        try:
+            queue_new_attachments(conn, changes)
+            send_queued_attachments(conn, s)
+        except Exception as error:
+            print(f"Attachment relay error: {redact_secrets(error)}")
     
     # Save snapshot
     save_current_snapshot(current, current_topics, current_posts)
