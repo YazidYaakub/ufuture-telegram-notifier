@@ -228,7 +228,8 @@ volumes:
 | `TELEGRAM_REPLY_DRAFT_TTL_HOURS` | How long pending Telegram reply drafts remain valid | `24` |
 | `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
 | `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
-| `UFUTURE_REPLY_ENABLED` | Enable live UiTM reply posting after preview confirmation; keep disabled until posting is verified | `false` |
+| `UFUTURE_REPLY_ENABLED` | Allow **Send to UiTM** to post replies (with attachments) to the forum after preview confirmation | `false` |
+| `REPLY_MIN_INTERVAL_SECONDS` | Minimum time between two posted replies | `60` |
 | `TELEGRAM_ALLOWED_USER_IDS` | Optional Telegram user IDs allowed to use reply actions, comma-separated for multiple users; blank allows the configured chat | blank |
 | `REPLY_CONFIRM_BEFORE_SEND` | Require preview confirmation before any UiTM reply post attempt | `true` |
 | `REPLY_POST_TIMEOUT_SECONDS` | Timeout for a confirmed UiTM reply post attempt | `45` |
@@ -414,11 +415,13 @@ The first run after upgrading re-reads every topic page once (up to `TOPIC_DETAI
 - `Details` shows stored topic/reply context inside Telegram.
 - `Reply` lets you choose `Original post` or a recent replyable reply, then write a response.
 - `Preview` shows the target and message before any post attempt.
-- `Confirm` is guarded; with the default config it keeps the draft in Telegram and does not post to UiTM.
+- Send files (documents, or photos) while a draft is open to attach them: up to 5 files, 20 MB each (the Telegram bot download limit). A file's caption becomes the reply text. `🗑 Remove files` clears them.
+- `Send to UiTM` (only with `UFUTURE_REPLY_ENABLED=true`) looks up the target post, uploads the text and files with UiTM's own reply form, then re-reads the topic and only reports `✅ Posted` once the reply is visible under the right post. Replies to a level-3 post go to its parent, as on the website.
+- Safety: preview and confirm before every post, allowed user only, identical replies to the same post are blocked, one post per `REPLY_MIN_INTERVAL_SECONDS`, and no automatic retries. If UiTM rejects the reply the draft stays ready to resend; if it can't be confirmed you are told to check the topic before sending again.
 - `Save Draft` stores the draft locally only; `Cancel` discards the flow.
 - `Media` opens the detected media/attachment URL instead of downloading it into Telegram.
 - `Open` opens the UiTM topic page.
-- UiTM posting is intentionally guarded and disabled by default.
+- UiTM posting is disabled by default; set `UFUTURE_REPLY_ENABLED=true` to turn it on.
 
 ## Security Notes
 

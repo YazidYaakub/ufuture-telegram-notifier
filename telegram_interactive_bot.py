@@ -1,6 +1,7 @@
 import html
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -28,6 +29,9 @@ POST_REPLIES_ENABLED = (
 )
 REPLY_CONFIRM_BEFORE_SEND = os.getenv("REPLY_CONFIRM_BEFORE_SEND", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_POST_TIMEOUT_SECONDS = int(os.getenv("REPLY_POST_TIMEOUT_SECONDS", "45"))
+REPLY_MIN_INTERVAL_SECONDS = int(os.getenv("REPLY_MIN_INTERVAL_SECONDS", "60"))
+REPLY_MAX_FILES = 5
+TELEGRAM_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024  # Bot API getFile limit
 TELEGRAM_ALLOWED_USER_IDS_PLACEHOLDERS = {"your_telegram_user_id", "telegram_user_id", "none", "null"}
 TELEGRAM_ALLOWED_USER_IDS = {
     item
@@ -112,6 +116,7 @@ def init_db(conn):
     ensure_column(conn, "telegram_pending_replies", "submitted_at", "TEXT")
     ensure_column(conn, "telegram_pending_replies", "result_message", "TEXT")
     ensure_column(conn, "telegram_pending_replies", "dedupe_key", "TEXT")
+    ensure_column(conn, "telegram_pending_replies", "attachments_json", "TEXT")
     conn.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -438,17 +443,20 @@ def update_pending_state(conn, pending_id, state, draft_text=None):
     conn.commit()
 
 
-def update_pending_preview(conn, pending_id, pending, draft_text):
+def update_pending_preview(conn, pending_id, pending, draft_text, attachments=None):
+    if attachments is None:
+        attachments = draft_attachments(pending)
     dedupe_source = "|".join([
         pending["topic_id"] or "",
         pending["target_post_id"] or "",
         draft_text or "",
+        ",".join(sorted(item.get("file_unique_id") or item.get("file_id") or "" for item in attachments)),
     ])
     dedupe_key = hashlib.sha256(dedupe_source.encode("utf-8")).hexdigest()
     conn.execute('''UPDATE telegram_pending_replies
-                    SET state = 'preview', draft_text = ?, dedupe_key = ?, updated_at = ?
+                    SET state = 'preview', draft_text = ?, attachments_json = ?, dedupe_key = ?, updated_at = ?
                     WHERE id = ?''',
-                 (draft_text, dedupe_key, datetime.now().isoformat(), pending_id))
+                 (draft_text, json.dumps(attachments), dedupe_key, datetime.now().isoformat(), pending_id))
     conn.commit()
 
 
@@ -598,7 +606,7 @@ def handle_reply_target(conn, callback, action_id, target_key):
             html_text(post.get("author") or "Unknown"),
             html_text(truncate_text(post.get("content_excerpt"), 220)),
             "",
-            "Type your reply message here.",
+            "Type your reply message here, and send files to attach them.",
             "Send /cancel to stop.",
             "",
             f"Draft id: <code>{html_text(pending_id)}</code>",
@@ -618,12 +626,16 @@ def build_preview_text(row):
         lines.append(html_text(row["target_excerpt"]))
     if row["target_posted_time"]:
         lines.append(html_text(row["target_posted_time"]))
+    files = draft_attachments(row)
     lines.extend([
         "",
         "<b>Your reply</b>",
-        html_text(row["draft_text"]),
-        "",
+        html_text(row["draft_text"]) if (row["draft_text"] or "").strip() else "<i>(no text yet: type your message)</i>",
     ])
+    if files:
+        lines.append(f"📎 {len(files)} file(s): " + html_text(", ".join(item.get("name") or "file" for item in files)))
+    lines.append("")
+    lines.append("Send files (as documents for full quality) to attach them.")
     if POST_REPLIES_ENABLED:
         if REPLY_CONFIRM_BEFORE_SEND:
             lines.append("Confirm before sending to UiTM.")
@@ -634,16 +646,77 @@ def build_preview_text(row):
     return "\n".join(lines)
 
 
-def build_preview_keyboard(pending_id):
+def build_preview_keyboard(pending_id, has_files=False):
     rows = [[
         {"text": "Send to UiTM", "callback_data": f"p:{pending_id}"},
-        {"text": "Edit", "callback_data": f"e:{pending_id}"},
+        {"text": "✏️ Edit text", "callback_data": f"e:{pending_id}"},
     ]]
+    if has_files:
+        rows.append([{"text": "🗑 Remove files", "callback_data": f"rf:{pending_id}"}])
     rows.append([
         {"text": "Save Draft", "callback_data": f"s:{pending_id}"},
         {"text": "Cancel", "callback_data": f"c:{pending_id}"},
     ])
     return {"inline_keyboard": rows}
+
+
+def send_preview(conn, chat_id, pending_id, reply_to_message_id=None):
+    pending = load_pending(conn, pending_id)
+    send_message(
+        chat_id,
+        build_preview_text(pending),
+        reply_markup=build_preview_keyboard(pending_id, has_files=bool(draft_attachments(pending))),
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+def telegram_file_from_message(message):
+    document = message.get("document")
+    if document:
+        return {
+            "file_id": document.get("file_id"),
+            "file_unique_id": document.get("file_unique_id"),
+            "name": document.get("file_name") or "file",
+            "size": document.get("file_size") or 0,
+            "mime": document.get("mime_type") or "application/octet-stream",
+        }
+    photos = message.get("photo") or []
+    if photos:
+        photo = max(photos, key=lambda item: item.get("file_size") or item.get("width", 0) * item.get("height", 0))
+        return {
+            "file_id": photo.get("file_id"),
+            "file_unique_id": photo.get("file_unique_id"),
+            "name": f"photo_{message.get('message_id')}.jpg",
+            "size": photo.get("file_size") or 0,
+            "mime": "image/jpeg",
+        }
+    return None
+
+
+def handle_draft_file(conn, chat_id, message, pending, item):
+    reply_to = message.get("message_id")
+    attachments = draft_attachments(pending)
+    if item["size"] > TELEGRAM_DOWNLOAD_MAX_BYTES:
+        send_message(chat_id, f"📎 {html_text(item['name'])} is over 20 MB, the largest file a Telegram bot can download.", reply_to_message_id=reply_to)
+        return
+    if len(attachments) >= REPLY_MAX_FILES:
+        send_message(chat_id, f"A reply can have at most {REPLY_MAX_FILES} files.", reply_to_message_id=reply_to)
+        return
+    if all(existing.get("file_unique_id") != item["file_unique_id"] for existing in attachments):
+        attachments.append(item)
+    draft_text = (message.get("caption") or "").strip() or pending["draft_text"] or ""
+    update_pending_preview(conn, pending["id"], pending, draft_text, attachments)
+    send_preview(conn, chat_id, pending["id"], reply_to)
+
+
+def handle_remove_files(conn, callback, pending_id):
+    row = load_pending(conn, pending_id)
+    if not row or row["state"] not in ("preview", "awaiting_text"):
+        answer_callback(callback["id"], "Draft expired or not found.")
+        return
+    update_pending_preview(conn, pending_id, row, row["draft_text"] or "", [])
+    answer_callback(callback["id"], "Files removed.")
+    send_preview(conn, callback["message"]["chat"]["id"], pending_id, callback["message"].get("message_id"))
 
 
 def handle_save_draft(conn, callback, pending_id):
@@ -679,16 +752,167 @@ def handle_edit_draft(conn, callback, pending_id):
     )
 
 
-def submit_reply_to_ufuture(_row):
-    _ = REPLY_POST_TIMEOUT_SECONDS
-    return False, (
-        "Live UiTM posting is not implemented yet. "
-        "The bot has the target, draft, and confirmation flow ready, but Phase 2B still needs "
-        "safe discovery of the UiTM reply modal form endpoint and CSRF/session fields."
+# ---- posting replies to UiTM ------------------------------------------------
+
+REPLY_URL_PATH = "/forumsv2/posts/reply"
+POST_LOOKUP_PATH = "/forumsv2/posts/get_post_ajax"
+
+
+def draft_attachments(row):
+    try:
+        items = json.loads(row["attachments_json"] or "[]")
+    except (TypeError, ValueError, IndexError, KeyError):
+        return []
+    return items if isinstance(items, list) else []
+
+
+def reply_html(text):
+    """Plain Telegram text -> the paragraph HTML UiTM's editor produces."""
+    paragraphs = [part for part in re.split(r"\n\s*\n", (text or "").strip()) if part.strip()]
+    return "".join(
+        "<p>" + "<br />".join(html.escape(line.strip(), quote=False) for line in part.splitlines()) + "</p>"
+        for part in paragraphs
     )
 
 
+def lookup_target_post(post_id):
+    """UiTM's own lookup used by its Reply dialog; logs in again once if the session expired."""
+    s = scraper()
+    for attempt in (1, 2):
+        session = uitm_session(fresh=attempt == 2)
+        response = session.get(
+            s.BASE_URL + POST_LOOKUP_PATH,
+            params={"Id": post_id},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        try:
+            post = (response.json() or {}).get("ChatPost") or {}
+        except ValueError:
+            if attempt == 2:
+                raise s.ScraperError("UiTM did not return the reply target (session expired?)")
+            continue
+        if post.get("id") != post_id:
+            raise s.ScraperError("UiTM returned a different post than the reply target")
+        return session, post
+
+
+def topic_posts_now(session, topic_url, topic_id):
+    s = scraper()
+    response = session.get(topic_url, timeout=30)
+    response.raise_for_status()
+    if urlparse_path(response.url).endswith("/login"):
+        raise s.ScraperError("UiTM session expired while reading the topic")
+    return s.extract_topic_posts(s.safe_soup(response.text), topic_id)
+
+
+def urlparse_path(url):
+    return scraper().urlparse(url or "").path.rstrip("/")
+
+
+def download_telegram_file(item):
+    s = scraper()
+    info = telegram_post("getFile", {"file_id": item["file_id"]}) or {}
+    file_path = (info.get("result") or {}).get("file_path")
+    if not file_path:
+        raise s.ScraperError(f"Telegram could not provide {item.get('name') or 'a file'}")
+    try:
+        response = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}", stream=True, timeout=60)
+        response.raise_for_status()
+        buffer = io.BytesIO()
+        for chunk in response.iter_content(64 * 1024):
+            buffer.write(chunk)
+            if buffer.tell() > TELEGRAM_DOWNLOAD_MAX_BYTES:
+                raise s.ScraperError(f"{item.get('name')} is larger than 20 MB")
+        response.close()
+    except requests.RequestException as error:
+        raise s.ScraperError(f"could not download {item.get('name')} from Telegram ({type(error).__name__})")
+    buffer.seek(0)
+    return buffer
+
+
+def find_posted_reply(posts, before_ids, parent_id, text):
+    wanted = " ".join((text or "").split())[:40]
+    for post in posts:
+        if (
+            post.get("is_own")
+            and post.get("post_id") not in before_ids
+            and post.get("parent_post_id") == parent_id
+            and wanted in " ".join((post.get("content_excerpt") or "").split())
+        ):
+            return post
+    return None
+
+
+def submit_reply_to_ufuture(row):
+    """Post the draft and confirm it on the forum.
+
+    Returns {"status": "posted" | "not_sent" | "unverified", "message": str}.
+    "not_sent" is only used when nothing can have been posted, so retrying is safe.
+    """
+    s = scraper()
+    files = draft_attachments(row)
+    try:
+        session, target = lookup_target_post(row["target_post_id"])
+        uploads = [(item, download_telegram_file(item)) for item in files]
+        before_ids = {post["post_id"] for post in topic_posts_now(session, row["topic_url"], row["topic_id"])}
+    except (s.ScraperError, requests.RequestException, ValueError) as error:
+        return {"status": "not_sent", "message": s.failure_summary(error)}
+
+    level = int(target.get("level") or 0)
+    # Same rule as UiTM's Reply dialog: replies to a level-3 post go to its parent.
+    parent_id = target.get("parent_id") if level == 3 and target.get("parent_id") else target["id"]
+    data = {
+        "_method": "POST",
+        "data[ChatPost][content]": reply_html(row["draft_text"]),
+        "replypost_id": parent_id,
+        "replypost_level_id": str(level),
+        "replypost_to": target.get("user_name") or "",
+    }
+    file_field = "data[ChatPostAttachment][files][]"
+    parts = [(file_field, (item["name"], buffer, item.get("mime") or "application/octet-stream")) for item, buffer in uploads]
+    parts = parts or [(file_field, ("", b"", "application/octet-stream"))]  # browsers send an empty part
+    try:
+        response = session.post(
+            s.BASE_URL + REPLY_URL_PATH, data=data, files=parts,
+            headers={"Referer": row["topic_url"]}, timeout=REPLY_POST_TIMEOUT_SECONDS, allow_redirects=True,
+        )
+        rejected = response.status_code >= 400 or urlparse_path(response.url).endswith("/login")
+    except requests.RequestException as error:
+        response, rejected = None, False
+        print(f"UiTM reply POST error: {type(error).__name__}")
+
+    time.sleep(2)
+    try:
+        posts = topic_posts_now(session, row["topic_url"], row["topic_id"])
+    except (s.ScraperError, requests.RequestException) as error:
+        return {"status": "unverified", "message": f"couldn't re-read the topic ({s.failure_summary(error)})"}
+    posted = find_posted_reply(posts, before_ids, parent_id, row["draft_text"])
+    if not posted:
+        if rejected:
+            return {"status": "not_sent", "message": f"UiTM rejected the reply (HTTP {response.status_code})"}
+        return {"status": "unverified", "message": "the reply did not appear on the topic page"}
+    message = "Posted to UiTM."
+    if len(posted.get("attachments") or []) < len(files):
+        message += f" Only {len(posted.get('attachments') or [])} of {len(files)} file(s) appear on the post."
+    return {"status": "posted", "message": message}
+
+
+def reply_rate_limited(conn):
+    last = get_state(conn, "last_reply_posted_at")
+    if not last:
+        return 0
+    try:
+        waited = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+    except ValueError:
+        return 0
+    return max(0, int(REPLY_MIN_INTERVAL_SECONDS - waited))
+
+
 def handle_send_reply(conn, callback, pending_id):
+    message = callback.get("message") or {}
+    chat_id, message_id = message["chat"]["id"], message.get("message_id")
     row = load_pending(conn, pending_id)
     if not row:
         answer_callback(callback["id"], "Draft expired or not found.")
@@ -696,48 +920,80 @@ def handle_send_reply(conn, callback, pending_id):
     if row["state"] != "preview":
         answer_callback(callback["id"], "Draft is not ready to send.")
         return
-    if not row["draft_text"]:
-        answer_callback(callback["id"], "Draft is empty.")
+    if not (row["draft_text"] or "").strip():
+        answer_callback(callback["id"], "Add a message first.")
+        send_message(chat_id, "Type your reply message before sending; files alone can't be posted.", reply_to_message_id=message_id)
         return
     if row["dedupe_key"]:
         duplicate = conn.execute('''SELECT id FROM telegram_pending_replies
                                     WHERE dedupe_key = ?
-                                      AND state = 'posted'
+                                      AND state IN ('posted', 'unverified')
                                       AND id != ?
                                     LIMIT 1''',
                                  (row["dedupe_key"], pending_id)).fetchone()
         if duplicate:
             answer_callback(callback["id"], "Duplicate reply blocked.")
             send_message(
-                callback["message"]["chat"]["id"],
-                "Duplicate reply blocked. This exact reply was already posted for the selected target.",
-                reply_to_message_id=callback["message"].get("message_id"),
+                chat_id,
+                "Duplicate reply blocked. This exact reply was already sent to the selected post.",
+                reply_to_message_id=message_id,
             )
             return
     if not POST_REPLIES_ENABLED:
         answer_callback(callback["id"], "UiTM posting disabled.")
         send_message(
-            callback["message"]["chat"]["id"],
+            chat_id,
             "\n".join([
                 "UiTM posting is disabled by <code>UFUTURE_REPLY_ENABLED=false</code>.",
                 "Your draft is still available. Use Save Draft, Edit, or Cancel.",
             ]),
-            reply_to_message_id=callback["message"].get("message_id"),
+            reply_to_message_id=message_id,
         )
         return
+    wait = reply_rate_limited(conn)
+    if wait:
+        answer_callback(callback["id"], f"Please wait {wait}s before posting again.")
+        return
+    # Claim the draft so a double tap can't post twice.
+    claimed = conn.execute(
+        "UPDATE telegram_pending_replies SET state = 'sending', updated_at = ? WHERE id = ? AND state = 'preview'",
+        (datetime.now().isoformat(), pending_id),
+    ).rowcount
+    conn.commit()
+    if not claimed:
+        answer_callback(callback["id"], "Already sending.")
+        return
+    answer_callback(callback["id"], "Posting to UiTM…")
 
-    ok, result_message = submit_reply_to_ufuture(row)
-    if ok:
-        update_pending_result(conn, pending_id, "posted", result_message)
-        answer_callback(callback["id"], "Posted to UiTM.")
+    result = submit_reply_to_ufuture(row)
+    open_button = {"inline_keyboard": [[{"text": "🌐 Open in UiTM", "url": row["topic_url"]}]]} if row["topic_url"] else None
+    files = draft_attachments(row)
+    if result["status"] == "posted":
+        update_pending_result(conn, pending_id, "posted", result["message"])
+        set_state(conn, "last_reply_posted_at", datetime.now().isoformat())
+        lines = [f"✅ <b>Posted to UiTM</b> · {html_text(row['topic_title'])}", f"Reply to {html_text(row['target_label'] or 'selected post')}"]
+        if files:
+            lines.append(f"📎 {len(files)} file(s) attached")
+        if result["message"] != "Posted to UiTM.":
+            lines.append(f"⚠️ {html_text(result['message'])}")
+        send_message(chat_id, "\n".join(lines), reply_markup=open_button, reply_to_message_id=message_id)
+    elif result["status"] == "not_sent":
+        update_pending_result(conn, pending_id, "preview", result["message"])
+        send_message(
+            chat_id,
+            f"❌ Not posted: {html_text(result['message'])}\nYour draft is unchanged; tap Send to UiTM to try again.",
+            reply_to_message_id=message_id,
+        )
     else:
-        update_pending_result(conn, pending_id, "send_failed", result_message)
-        answer_callback(callback["id"], "Posting failed.")
-    send_message(
-        callback["message"]["chat"]["id"],
-        html_text(result_message),
-        reply_to_message_id=callback["message"].get("message_id"),
-    )
+        update_pending_result(conn, pending_id, "unverified", result["message"])
+        set_state(conn, "last_reply_posted_at", datetime.now().isoformat())
+        send_message(
+            chat_id,
+            f"⚠️ The reply was submitted, but I couldn't confirm it: {html_text(result['message'])}.\n"
+            "Check the topic in UiTM before sending it again.",
+            reply_markup=open_button,
+            reply_to_message_id=message_id,
+        )
 
 
 def handle_cancel(conn, callback, pending_id):
@@ -1279,6 +1535,8 @@ def handle_callback(conn, callback):
         handle_navigation(conn, callback, prefix, identifier)
     elif prefix == "f":
         handle_send_file(conn, callback, identifier)
+    elif prefix == "rf":
+        handle_remove_files(conn, callback, identifier)
     elif prefix in {"mu", "um"}:
         handle_mute_button(conn, callback, identifier, prefix == "mu")
     elif prefix == "o":
@@ -1321,7 +1579,19 @@ def handle_message(conn, message):
         print("Ignored message from unauthorized user")
         return
     text = (message.get("text") or "").strip()
-    if not text:
+    incoming_file = telegram_file_from_message(message)
+    if not text and not incoming_file:
+        return
+    if incoming_file:
+        pending = latest_open_reply(conn, chat_id, user_id)
+        if not pending:
+            send_message(
+                chat_id,
+                "To attach a file to a forum reply, tap ✍️ Reply on a topic first, then send the file.",
+                reply_to_message_id=message.get("message_id"),
+            )
+            return
+        handle_draft_file(conn, chat_id, message, pending, incoming_file)
         return
     if text.startswith("/"):
         command, _, argument = text[1:].partition(" ")
@@ -1336,20 +1606,22 @@ def handle_message(conn, message):
             return
         handle_command(conn, chat_id, command, argument.strip())
         return
-    pending = latest_pending_reply(conn, chat_id, user_id)
-    if not pending:
+    pending = latest_open_reply(conn, chat_id, user_id)
+    # Text fills the draft while it is awaiting text, or a preview that only has files so far.
+    if pending and (pending["state"] == "awaiting_text" or not (pending["draft_text"] or "").strip()):
+        update_pending_preview(conn, pending["id"], pending, text)
+        send_preview(conn, chat_id, pending["id"], message.get("message_id"))
+        return
+    if pending:
         send_message(
             chat_id,
-            "No reply draft is open. Tap ✍️ Reply on a topic to start one, or see /help.",
+            "Your reply is in the preview above. Tap ✏️ Edit text to change it, or send a file to attach it.",
             reply_to_message_id=message.get("message_id"),
         )
         return
-    update_pending_preview(conn, pending["id"], pending, text)
-    pending = load_pending(conn, pending["id"])
     send_message(
         chat_id,
-        build_preview_text(pending),
-        reply_markup=build_preview_keyboard(pending["id"]),
+        "No reply draft is open. Tap ✍️ Reply on a topic to start one, or see /help.",
         reply_to_message_id=message.get("message_id"),
     )
 
