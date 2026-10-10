@@ -392,6 +392,21 @@ The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts
 - **Classmates' replies** are grouped into one silent "Classmate replies" summary per run, with counts and first names.
 - Each topic has a single `Topic ▸` button that turns the message into a topic card (`📄 Details`, `✍️ Reply`, `🌐 Open in UiTM`, `« Back`). Details and Back edit the same message instead of adding new ones.
 
+### Bot Commands
+| Command | What it does |
+|---|---|
+| `/latest` | The 5 newest posts (excluding yours), each with a `▸` button to its topic card |
+| `/courses` | Browse course → week → topic, ending at the topic card |
+| `/files` | Pick a course, then tap a file to get it in the chat |
+| `/status` | Last successful check, last failure and reason, counts, attachment queue, muted courses |
+| `/mute CSC649`, `/unmute CSC649` | Silence a course; replies to your posts still notify. Without a code, shows course buttons |
+| `/help` | Lists the commands; the bot also shows a hint when you send text without an open reply draft |
+| `/cancel` | Cancel the current reply draft |
+
+Files already sent to Telegram are re-sent instantly from their Telegram `file_id`. Other files are downloaded by the bot with its own UiTM login, in memory only, and sent; nothing is written to disk. Topic cards show a `📎 Files` button when the topic has attachments.
+
+The first run after upgrading re-reads every topic page once (up to `TOPIC_DETAIL_LIMIT`) to fill in attachments and your own posts for data stored by older versions. No notifications are sent for this refresh.
+
 ### Interactive Telegram Bot
 - `Topic ▸` opens the topic card in place; `« Back` restores the original notification.
 - `Details` shows stored topic/reply context inside Telegram.

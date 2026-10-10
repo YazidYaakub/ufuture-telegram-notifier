@@ -69,6 +69,7 @@ TELEGRAM_SEND_ATTACHMENTS = os.getenv("TELEGRAM_SEND_ATTACHMENTS", "true").strip
 ATTACHMENT_MAX_MB = float(os.getenv("ATTACHMENT_MAX_MB", "20"))
 ATTACHMENT_MAX_PER_RUN = int(os.getenv("ATTACHMENT_MAX_PER_RUN", "5"))
 ATTACHMENT_MAX_ATTEMPTS = 3
+DETAIL_BACKFILL_VERSION = "1"
 TELEGRAM_LAYOUT = os.getenv("TELEGRAM_LAYOUT", "digest").strip().lower()
 
 EXIT_OK = 0
@@ -2109,6 +2110,87 @@ def send_queued_attachments(conn, session):
 # MAIN
 # ============================================================================
 
+def login(session):
+    """Log the session in to UiTM. Shared with the interactive bot for file downloads."""
+    request_with_retries(session, "GET", LOGIN_URL, context="Fetch login page", timeout=30)
+    post_data = {
+        "data[User][username]": USERNAME,
+        "data[User][password]": PASSWORD,
+        "data[User][role]": ROLE,
+        "_method": "POST"
+    }
+    login_response = request_with_retries(
+        session,
+        "POST",
+        LOGIN_URL,
+        context="Submit login",
+        data=post_data,
+        headers=HEADERS,
+        allow_redirects=True,
+        timeout=30,
+    )
+    # A successful login redirects away from /login (to /courses/list_course).
+    if urlparse(login_response.url).path.rstrip("/").endswith("/login"):
+        raise LoginError(
+            "UiTM login was rejected (still on the login page). "
+            "Check UFUTURE_USERNAME/UFUTURE_PASSWORD; not retrying to avoid account lockout."
+        )
+
+
+def get_bot_state(conn, key, default=None):
+    row = conn.execute("SELECT value FROM telegram_bot_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def muted_courses(conn):
+    try:
+        return set(json.loads(get_bot_state(conn, "muted_courses", "[]")))
+    except (TypeError, ValueError):
+        return set()
+
+
+def apply_course_mutes(conn, changes):
+    """Muted courses (set with /mute in Telegram) only notify about replies to your posts."""
+    muted = muted_courses(conn)
+    if not changes or not muted:
+        return changes
+    kept = []
+    for change in changes:
+        if change.get("course_code") not in muted:
+            kept.append(change)
+            continue
+        topics = [topic for topic in change.get("topic_details") or [] if topic.get("replied_to_me")]
+        if topics:
+            kept.append(dict(change, topic_details=topics, silent=False))
+        else:
+            print(f"{change.get('course_code')} is muted; skipping {change.get('week')}")
+    return kept or None
+
+
+def record_run_status(ok, reason=""):
+    """Last success/failure for the bot's /status command; never fails the run."""
+    stamp = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    values = {"last_success_at": stamp} if ok else {"last_failure_at": stamp, "last_failure_reason": reason[:200]}
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        conn.execute("CREATE TABLE IF NOT EXISTS telegram_bot_state (key TEXT PRIMARY KEY, value TEXT)")
+        conn.executemany("INSERT OR REPLACE INTO telegram_bot_state (key, value) VALUES (?, ?)", values.items())
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as error:
+        print(f"Could not record run status: {error}")
+
+
+def failure_summary(error):
+    if isinstance(error, LoginError):
+        return "UiTM login rejected"
+    if isinstance(error, TemporaryNetworkError):
+        return "network or DNS problem"
+    if isinstance(error, ConfigError):
+        return "missing configuration"
+    return truncate_text(redact_secrets(error), 160)
+
+
 def run_scrape():
     print(f"\n{'='*80}")
     print(f"UiTM Forum Scraper + Telegram Notifier")
@@ -2123,29 +2205,7 @@ def run_scrape():
 
     # Login
     try:
-        request_with_retries(s, "GET", LOGIN_URL, context="Fetch login page", timeout=30)
-        post_data = {
-            "data[User][username]": USERNAME,
-            "data[User][password]": PASSWORD,
-            "data[User][role]": ROLE,
-            "_method": "POST"
-        }
-        login_response = request_with_retries(
-            s,
-            "POST",
-            LOGIN_URL,
-            context="Submit login",
-            data=post_data,
-            headers=HEADERS,
-            allow_redirects=True,
-            timeout=30,
-        )
-        # A successful login redirects away from /login (to /courses/list_course).
-        if urlparse(login_response.url).path.rstrip("/").endswith("/login"):
-            raise LoginError(
-                "UiTM login was rejected (still on the login page). "
-                "Check UFUTURE_USERNAME/UFUTURE_PASSWORD; not retrying to avoid account lockout."
-            )
+        login(s)
         print("Logged in successfully")
     except ScraperError:
         conn.close()
@@ -2247,10 +2307,20 @@ def run_scrape():
 
     # Topic/post ids seen in earlier runs; read before this run's details are saved.
     detail_history = load_detail_history(conn)
-    fetch_all_topics = TOPIC_DETAIL_MODE == "all" or not detail_history["topics"]
+    # One full pass refills fields older versions never stored (attachments, own posts).
+    needs_backfill = get_bot_state(conn, "detail_backfill_version") != DETAIL_BACKFILL_VERSION
+    fetch_all_topics = TOPIC_DETAIL_MODE == "all" or not detail_history["topics"] or needs_backfill
+    if needs_backfill and detail_history["topics"]:
+        print("Refreshing all topic details once to fill in attachments and own posts")
 
     # Extract topic/post details after the week overview has succeeded.
     topic_details, post_details = scrape_topic_details(s, all_results, changes, fetch_all_topics)
+    if needs_backfill and topic_details:
+        conn.execute(
+            "INSERT OR REPLACE INTO telegram_bot_state (key, value) VALUES ('detail_backfill_version', ?)",
+            (DETAIL_BACKFILL_VERSION,),
+        )
+        conn.commit()
 
     # Save topic details to database.
     save_to_db(conn, courses, all_results, topic_details, post_details)
@@ -2260,6 +2330,7 @@ def run_scrape():
     current_topics = get_current_topic_state(conn, fetched_topic_ids)
     current_posts = get_current_post_state(conn, fetched_topic_ids)
     changes = attach_topic_details(changes, current_topics, current_posts, detail_history)
+    changes = apply_course_mutes(conn, changes)
     
     # Display results
     print(f"Scrape completed: {len(all_results)} courses, {total_weeks} weeks\n")
@@ -2296,12 +2367,16 @@ def run_scrape():
 def main():
     try:
         validate_config()
-        return run_scrape()
+        code = run_scrape()
+        record_run_status(True)
+        return code
     except ScraperError as error:
         print(f"Scraper failed: {error}")
+        record_run_status(False, failure_summary(error))
         return error.exit_code
     except Exception as error:
-        print(f"Unexpected scraper failure: {error}")
+        print(f"Unexpected scraper failure: {redact_secrets(error)}")
+        record_run_status(False, f"unexpected error ({type(error).__name__})")
         return EXIT_FAILURE
 
 if __name__ == "__main__":
