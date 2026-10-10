@@ -18,9 +18,11 @@ RUN mkdir -p /app/data /app/logs
 
 # Create scheduler script
 COPY scheduler.py .
+COPY telegram_interactive_bot.py .
+COPY supervisor.py .
 
 # Health check
 HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 CMD python -c "import os, socket, sqlite3; socket.gethostbyname('ufuture.uitm.edu.my'); sqlite3.connect(os.environ['DB_PATH']).execute('SELECT 1')" || exit 1
 
-# Run scheduler
-CMD ["python", "/app/scheduler.py"]
+# Run scheduler and interactive Telegram bot under a small supervisor
+CMD ["python", "/app/supervisor.py"]
