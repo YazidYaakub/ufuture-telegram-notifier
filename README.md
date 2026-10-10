@@ -381,7 +381,7 @@ File contents are never stored.
 - Orders posts by posted time (UiTM renders nested replies out of time order)
 - Skips your own posts; a change made only of your own posts sends nothing
 - Tags replies to your posts with `↩️ you` and posts by the topic creator with `📌`, lists attachment names with `📎`
-- Sends attachments from new posts into Telegram as a reply to the notification (attachments that already existed before are not sent). Failed downloads are retried on the next runs, up to 3 attempts
+- Sends attachments from new posts into Telegram as a reply to the notification (attachments that already existed before are not sent). Images (`.jpg`, `.jpeg`, `.png`, `.webp`, up to 10 MB) are shown inline as photos; everything else is sent as a file. Failed downloads are retried on the next runs, up to 3 attempts
 - Prioritizes changed weeks before spending the topic detail limit, then adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
