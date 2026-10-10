@@ -150,13 +150,29 @@ services:
       - TOPIC_DETAIL_LIMIT=20
       - INCLUDE_REPLY_EXCERPTS=true
       - REPLY_EXCERPT_LENGTH=160
+      - DETAIL_EXCERPT_LENGTH=700
       - TELEGRAM_MAX_TOPICS_PER_MESSAGE=8
       - TELEGRAM_INLINE_BUTTONS=true
       - TELEGRAM_DEDUP_REPLIES=true
       - TELEGRAM_SHORT_NAMES=true
       - TELEGRAM_MEDIA_BUTTONS=true
+      - TELEGRAM_REPLY_TARGET_LIMIT=8
+      - TELEGRAM_INTERACTIVE_BOT=true
+      - TELEGRAM_BUTTON_MODE=hybrid
+      - TELEGRAM_ACTION_TTL_HOURS=72
+      - TELEGRAM_REPLY_DRAFT_TTL_HOURS=24
+      - TELEGRAM_BOT_RESTART_SECONDS=5
+      - TELEGRAM_DROP_PENDING_UPDATES=true
+      - UFUTURE_REPLY_ENABLED=false
+      - TELEGRAM_ALLOWED_USER_IDS=
+      - REPLY_CONFIRM_BEFORE_SEND=true
+      - REPLY_POST_TIMEOUT_SECONDS=45
+      - UFUTURE_POST_REPLIES=false
       - SCRAPER_TIMEOUT_SECONDS=300
       - SCRAPER_FAILURE_LIMIT=0
+      - SCRAPER_ALERT_AFTER=3
+      - TOPIC_DETAIL_MODE=changed
+      - TELEGRAM_SILENT_CLASSMATE_REPLIES=true
     
     volumes:
       - ufuture-data:/app/data
@@ -174,6 +190,7 @@ volumes:
    - `your_password` = your UiTM password
    - `your_bot_token` = Telegram bot token
    - `your_chat_id` = Telegram chat ID
+   - `TELEGRAM_ALLOWED_USER_IDS` can be left blank, or set to your Telegram user ID to lock reply actions to one user
 
 4. **Click Deploy**
 
@@ -198,18 +215,37 @@ volumes:
 | `TOPIC_DETAIL_LIMIT` | Maximum topic detail pages fetched per scraper run | `20` |
 | `INCLUDE_REPLY_EXCERPTS` | Include short reply excerpts in Telegram notifications | `true` |
 | `REPLY_EXCERPT_LENGTH` | Maximum stored/sent reply excerpt length | `160` |
+| `DETAIL_EXCERPT_LENGTH` | Maximum stored excerpt length used by interactive Details views | `700` |
 | `TELEGRAM_MAX_TOPICS_PER_MESSAGE` | Maximum topic detail blocks included per changed week | `8` |
 | `TELEGRAM_INLINE_BUTTONS` | Add Telegram inline URL buttons for changed topics | `true` |
 | `TELEGRAM_DEDUP_REPLIES` | Compact repeated identical reply excerpts with a multiplier | `true` |
 | `TELEGRAM_SHORT_NAMES` | Shorten long display names in the main notification | `true` |
 | `TELEGRAM_MEDIA_BUTTONS` | Show a media button when a media/attachment URL is detected | `true` |
+| `TELEGRAM_REPLY_TARGET_LIMIT` | Maximum recent replyable posts offered as Telegram reply targets, excluding the original post | `8` |
+| `TELEGRAM_INTERACTIVE_BOT` | Run the long-polling interactive Telegram bot worker | `true` |
+| `TELEGRAM_BUTTON_MODE` | Button behavior; `hybrid` uses callback buttons for Details/Reply and URL buttons for Media/Open | `hybrid` |
+| `TELEGRAM_ACTION_TTL_HOURS` | How long notification callback actions remain valid | `72` |
+| `TELEGRAM_REPLY_DRAFT_TTL_HOURS` | How long pending Telegram reply drafts remain valid | `24` |
+| `TELEGRAM_BOT_RESTART_SECONDS` | Supervisor delay before restarting a crashed bot worker | `5` |
+| `TELEGRAM_DROP_PENDING_UPDATES` | Ignore queued Telegram updates on the first bot start after deployment | `true` |
+| `UFUTURE_REPLY_ENABLED` | Enable live UiTM reply posting after preview confirmation; keep disabled until posting is verified | `false` |
+| `TELEGRAM_ALLOWED_USER_IDS` | Optional Telegram user IDs allowed to use reply actions, comma-separated for multiple users; blank allows the configured chat | blank |
+| `REPLY_CONFIRM_BEFORE_SEND` | Require preview confirmation before any UiTM reply post attempt | `true` |
+| `REPLY_POST_TIMEOUT_SECONDS` | Timeout for a confirmed UiTM reply post attempt | `45` |
+| `UFUTURE_POST_REPLIES` | Legacy live-posting guard; prefer `UFUTURE_REPLY_ENABLED` | `false` |
 | `SCRAPER_TIMEOUT_SECONDS` | Scheduler subprocess timeout | `300` |
 | `SCRAPER_FAILURE_LIMIT` | Exit scheduler after N failures; `0` means never exit | `0` |
 | `SCRAPER_PATH` | Path used by scheduler to run scraper | container scraper path |
+| `SCRAPER_ALERT_AFTER` | Send one Telegram alert after N consecutive failed runs, and a recovery message when it works again; `0` disables | `3` |
+| `TOPIC_DETAIL_MODE` | `changed` fetches topic pages only for weeks whose counts changed (plus a full fetch when the database has no topics yet); `all` fetches up to `TOPIC_DETAIL_LIMIT` topics every run | `changed` |
+| `TELEGRAM_SILENT_CLASSMATE_REPLIES` | Send notifications silently when they only contain classmates' replies; new topics, posts by the topic creator, and replies to your posts still notify with sound | `true` |
+| `DRY_RUN` | Print Telegram messages and alerts instead of sending them; use with temporary `DB_PATH`/`SNAPSHOT_PATH` | `false` |
 
 ## Telegram Setup
 
-Topic detail notifications can include inline buttons. `Reply` and `Details` open the UiTM topic page in your browser. `Media` appears only when a media or attachment URL is detected. The scraper does not post replies to UiTM; replies remain manual inside the authenticated UiTM session.
+Topic detail notifications can include inline buttons. In `hybrid` mode, `Details` and `Reply` are Telegram callback buttons handled inside the chat, while `Media` and `Open` remain URL buttons. `Media` appears only when a media or attachment URL is detected. Reply target selection, preview, edit, save draft, and cancel run inside Telegram; live UiTM posting remains guarded by `UFUTURE_REPLY_ENABLED=false` until the posting path is verified.
+
+The container runs a small supervisor that starts both the scraper scheduler and the interactive Telegram bot worker. The bot uses Telegram long polling, stores its update offset in SQLite, and only responds to the configured `TELEGRAM_CHAT_ID`.
 
 ### Create Telegram Bot
 
@@ -232,6 +268,8 @@ Or use bot like **@userinfobot** to get your chat ID directly
 ufuture-forum-scraper/
 ├── ufuture-scraper.py                       # Main application
 ├── scheduler.py                             # Runs scraper every 10 minutes
+├── telegram_interactive_bot.py              # Handles Telegram callback buttons and reply drafts
+├── supervisor.py                            # Runs scheduler and interactive bot in one container
 ├── Dockerfile                                # Docker build configuration
 ├── pyproject.toml                            # UV dependencies
 ├── uv.lock                                   # Locked dependency versions
@@ -294,6 +332,8 @@ author          TEXT
 content_excerpt TEXT
 media_url       TEXT
 media_label     TEXT
+attachments_json TEXT     -- all attachments in the post: [{"url", "label"}]
+is_own          INTEGER   -- 1 when the post belongs to the logged-in user
 posted_time     TEXT
 last_updated    TIMESTAMP
 UNIQUE(topic_id, post_id)
@@ -311,12 +351,26 @@ UNIQUE(topic_id, post_id)
 - Scrapes forums again
 - Compares with previous state
 - Detects: new posts, new topics, latest user activity
-- Adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
+- Compares against every post id already stored in SQLite, so new replies are exact even when there are more topics than `TOPIC_DETAIL_LIMIT`
+- Orders posts by posted time (UiTM renders nested replies out of time order)
+- Skips your own posts; a change made only of your own posts sends nothing
+- Tags replies to your posts with `↩️ you` and posts by the topic creator with `📌`, lists attachment names with `📎`
+- Prioritizes changed weeks before spending the topic detail limit, then adds topic titles, recent reply excerpts, inline topic buttons, and optional media buttons when topic detail scraping is enabled
 - **Sends Telegram notification** if changes found
 - Updates state snapshot
 
 ### State Comparison
 The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts`. Older week-only snapshot lists are still accepted and upgraded on the next successful run. On the first upgraded run, topic details enrich the notification; exact per-post diffs become available after one version-2 snapshot exists.
+
+### Interactive Telegram Bot
+- `Details` shows stored topic/reply context inside Telegram.
+- `Reply` lets you choose `Original post` or a recent replyable reply, then write a response.
+- `Preview` shows the target and message before any post attempt.
+- `Confirm` is guarded; with the default config it keeps the draft in Telegram and does not post to UiTM.
+- `Save Draft` stores the draft locally only; `Cancel` discards the flow.
+- `Media` opens the detected media/attachment URL instead of downloading it into Telegram.
+- `Open` opens the UiTM topic page.
+- UiTM posting is intentionally guarded and disabled by default.
 
 ## Security Notes
 
@@ -368,7 +422,7 @@ If you use Technitium DNS, check its query logs, allowlist the UiTM domain if bl
 **Solution:** Verify bot token and chat ID are correct
 
 ### Container says scraper completed with non-zero code
-**Solution:** Read the scraper log immediately above that line. Exit code `75` means a temporary network or DNS failure. Exit code `2` means required configuration is missing.
+**Solution:** Read the scraper log immediately above that line. Exit code `75` means a temporary network or DNS failure. Exit code `3` means UiTM rejected the login (the scraper does not retry, to avoid locking the account). Exit code `2` means required configuration is missing.
 
 ### No database file created
 **Solution:** Check `DB_PATH` in environment variables is correct
@@ -418,6 +472,12 @@ docker build -f Dockerfile -t ufuture-forum-scraper:latest .
 ```
 
 The live scraper contacts UiTM and Telegram, so run it only when your environment variables are set and you intend to perform a real scrape.
+
+For interactive-bot branch changes, also validate:
+
+```bash
+uv run python -m py_compile telegram_interactive_bot.py supervisor.py
+```
 
 ### Update Docker image (TrueNAS)
 

@@ -9,12 +9,13 @@ import re
 import socket
 import time
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import sys
 import html
 import hashlib
+import secrets
 from requests import RequestException
 
 # Fix Python 3.12+ deprecation warning
@@ -48,15 +49,26 @@ SCRAPE_TOPIC_DETAILS = os.getenv("SCRAPE_TOPIC_DETAILS", "true").strip().lower()
 TOPIC_DETAIL_LIMIT = int(os.getenv("TOPIC_DETAIL_LIMIT", "20"))
 INCLUDE_REPLY_EXCERPTS = os.getenv("INCLUDE_REPLY_EXCERPTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 REPLY_EXCERPT_LENGTH = int(os.getenv("REPLY_EXCERPT_LENGTH", "160"))
+DETAIL_EXCERPT_LENGTH = int(os.getenv("DETAIL_EXCERPT_LENGTH", "700"))
 TELEGRAM_MAX_TOPICS_PER_MESSAGE = int(os.getenv("TELEGRAM_MAX_TOPICS_PER_MESSAGE", "8"))
 TELEGRAM_INLINE_BUTTONS = os.getenv("TELEGRAM_INLINE_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_DEDUP_REPLIES = os.getenv("TELEGRAM_DEDUP_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_SHORT_NAMES = os.getenv("TELEGRAM_SHORT_NAMES", "true").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_MEDIA_BUTTONS = os.getenv("TELEGRAM_MEDIA_BUTTONS", "true").strip().lower() in {"1", "true", "yes", "on"}
+TELEGRAM_REPLY_TARGET_LIMIT = int(os.getenv("TELEGRAM_REPLY_TARGET_LIMIT", "8"))
+TELEGRAM_BUTTON_MODE = os.getenv("TELEGRAM_BUTTON_MODE", "hybrid").strip().lower()
+TELEGRAM_ACTION_TTL_HOURS = int(os.getenv("TELEGRAM_ACTION_TTL_HOURS", "72"))
+TELEGRAM_REPLY_DRAFT_TTL_HOURS = int(os.getenv("TELEGRAM_REPLY_DRAFT_TTL_HOURS", "24"))
+TELEGRAM_INTERACTIVE_BOT = os.getenv("TELEGRAM_INTERACTIVE_BOT", "true").strip().lower() in {"1", "true", "yes", "on"}
+UFUTURE_POST_REPLIES = os.getenv("UFUTURE_POST_REPLIES", "false").strip().lower() in {"1", "true", "yes", "on"}
+TOPIC_DETAIL_MODE = os.getenv("TOPIC_DETAIL_MODE", "changed").strip().lower()
+TELEGRAM_SILENT_CLASSMATE_REPLIES = os.getenv("TELEGRAM_SILENT_CLASSMATE_REPLIES", "true").strip().lower() in {"1", "true", "yes", "on"}
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_CONFIG = 2
+EXIT_LOGIN = 3
 EXIT_TEMPORARY_FAILURE = 75
 
 # Create directories if they don't exist
@@ -78,6 +90,10 @@ class ConfigError(ScraperError):
     exit_code = EXIT_CONFIG
 
 
+class LoginError(ScraperError):
+    exit_code = EXIT_LOGIN
+
+
 class TemporaryNetworkError(ScraperError):
     exit_code = EXIT_TEMPORARY_FAILURE
 
@@ -93,9 +109,9 @@ def validate_config():
         errors.append("UFUTURE_USERNAME not set")
     if not PASSWORD:
         errors.append("UFUTURE_PASSWORD not set")
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN and not DRY_RUN:
         errors.append("TELEGRAM_BOT_TOKEN not set")
-    if not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_CHAT_ID and not DRY_RUN:
         errors.append("TELEGRAM_CHAT_ID not set")
     
     if errors:
@@ -160,6 +176,8 @@ def init_db():
         topic_id TEXT,
         post_id TEXT,
         parent_post_id TEXT,
+        post_level INTEGER,
+        replyable INTEGER,
         author TEXT,
         content_excerpt TEXT,
         media_url TEXT,
@@ -171,6 +189,63 @@ def init_db():
 
     ensure_column(c, "posts", "media_url", "TEXT")
     ensure_column(c, "posts", "media_label", "TEXT")
+    ensure_column(c, "posts", "post_level", "INTEGER DEFAULT 0")
+    ensure_column(c, "posts", "replyable", "INTEGER DEFAULT 0")
+    ensure_column(c, "posts", "is_own", "INTEGER DEFAULT 0")
+    ensure_column(c, "posts", "attachments_json", "TEXT")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_actions (
+        action_id TEXT PRIMARY KEY,
+        action_type TEXT NOT NULL,
+        chat_id TEXT,
+        message_id TEXT,
+        course_code TEXT,
+        week_title TEXT,
+        topic_id TEXT,
+        post_id TEXT,
+        topic_url TEXT,
+        media_url TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        payload_json TEXT
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_pending_replies (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        topic_id TEXT NOT NULL,
+        post_id TEXT,
+        topic_url TEXT,
+        source_action_id TEXT,
+        target_post_id TEXT,
+        target_author TEXT,
+        target_excerpt TEXT,
+        target_posted_time TEXT,
+        target_label TEXT,
+        topic_title TEXT,
+        draft_text TEXT,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )''')
+    ensure_column(c, "telegram_pending_replies", "topic_url", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "source_action_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_post_id", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_author", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_excerpt", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_posted_time", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "target_label", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "submitted_at", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "result_message", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "dedupe_key", "TEXT")
+
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
     
     conn.commit()
     return conn
@@ -180,7 +255,11 @@ def ensure_column(cursor, table, column, definition):
     cursor.execute(f"PRAGMA table_info({table})")
     columns = {row[1] for row in cursor.fetchall()}
     if column not in columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
 
 # ============================================================================
 # SCRAPING FUNCTIONS
@@ -424,7 +503,8 @@ def extract_week_topics(soup, course_code, week_title):
         description = first_regex(block_text, rf"{title_pattern}\s+(.*?)\s+Created By\s*:")
         created_by = first_regex(block_text, r"Created By\s*:\s*(.*?)\s+Created At\s*:")
         created_at = first_regex(block_text, r"Created At\s*:\s*(.*?)\s+Replies\s*:")
-        replies = parse_count(first_regex(block_text, r"Replies\s*:\s*(\d+)"))
+        # UiTM's "Replies" count includes the original post.
+        replies = max(0, parse_count(first_regex(block_text, r"Replies\s*:\s*(\d+)")) - 1)
         last_activity = first_regex(block_text, r"Last Activity\s*:\s*(.*?)\s+Open\s*:")
         status = first_regex(block_text, r"Open\s*:\s*([A-Za-z]+)")
 
@@ -476,6 +556,9 @@ def extract_post_author(body, reply_div):
 
 
 def extract_posted_time(actions):
+    time_el = actions.select_one(".timehover[title]") if actions else None
+    if time_el and time_el.get("title"):
+        return time_el.get("title").strip()
     actions_text = normalize_text(actions)
     return first_regex(actions_text, r"Posted\s+(.+?)(?:\s+Reply|$)")
 
@@ -486,8 +569,21 @@ def media_label_from_url(url):
     return filename or "Media"
 
 
-def extract_media_link(body, reply_div):
-    containers = [reply_div, body]
+def is_avatar_image(img):
+    src = (img.get("src") or "").lower()
+    return "gambar_warga" in src or "rounded-circle" in (img.get("class") or [])
+
+
+def extract_attachments(reply_div):
+    """Collect attachments from the post's own content only.
+
+    The surrounding media-body also contains nested replies and their avatars,
+    so it must not be searched.
+    """
+    if not reply_div:
+        return []
+
+    attachments = []
     seen = set()
     media_extensions = (
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc", ".docx",
@@ -495,48 +591,38 @@ def extract_media_link(body, reply_div):
         ".mp3", ".wav",
     )
 
-    for container in containers:
-        if not container:
-            continue
+    def add(url, label):
+        if url and url not in seen:
+            seen.add(url)
+            attachments.append({"url": url, "label": label or media_label_from_url(url)})
 
-        for img in container.find_all("img", src=True):
-            src = img.get("src", "").strip()
-            if not src:
-                continue
+    for anchor in reply_div.select('a[href*="/forumsv2/attachments/download/"]'):
+        add(urljoin(BASE_URL, anchor.get("href", "").strip()), normalize_text(anchor))
+
+    for img in reply_div.find_all("img", src=True):
+        src = img.get("src", "").strip()
+        if src and not src.startswith("data:") and not is_avatar_image(img):
             media_url = urljoin(BASE_URL, src)
-            return media_url, img.get("alt") or media_label_from_url(media_url)
+            add(media_url, img.get("alt") or media_label_from_url(media_url))
 
-        for anchor in container.find_all("a", href=True):
-            href = anchor.get("href", "").strip()
-            if not href or href in seen:
-                continue
-            seen.add(href)
+    for anchor in reply_div.find_all("a", href=True):
+        href = anchor.get("href", "").strip()
+        href_lower = href.lower()
+        if (
+            not href
+            or href_lower.startswith(("#", "javascript:", "mailto:"))
+            or "open-DialogReply" in (anchor.get("class") or [])
+        ):
+            continue
+        if any(urlparse(href_lower).path.endswith(ext) for ext in media_extensions):
+            add(urljoin(BASE_URL, href), normalize_text(anchor))
 
-            href_lower = href.lower()
-            classes = anchor.get("class") or []
-            text = normalize_text(anchor)
-            if (
-                "open-DialogReply" in classes
-                or href_lower.startswith("#")
-                or href_lower.startswith("javascript:")
-                or href_lower.startswith("mailto:")
-            ):
-                continue
+    return attachments
 
-            looks_like_media = (
-                any(urlparse(href_lower).path.endswith(ext) for ext in media_extensions)
-                or "download" in href_lower
-                or "attachment" in href_lower
-                or "file" in href_lower
-                or "media" in href_lower
-            )
-            if not looks_like_media:
-                continue
 
-            media_url = urljoin(BASE_URL, href)
-            return media_url, text or media_label_from_url(media_url)
-
-    return "", ""
+def is_own_post(actions):
+    # Only the logged-in user's own posts get an Edit action.
+    return bool(actions and actions.select_one(".open-DialogEdit"))
 
 
 def extract_topic_posts(soup, topic_id):
@@ -544,7 +630,7 @@ def extract_topic_posts(soup, topic_id):
     posts = []
     seen = set()
 
-    def parse_media(media, parent_post_id=None):
+    def parse_media(media, parent_post_id=None, post_level=0):
         body = direct_media_body(media)
         if not body:
             return
@@ -562,23 +648,27 @@ def extract_topic_posts(soup, topic_id):
         post_id = reply_link.get("data-id") if reply_link else ""
         if not post_id:
             post_id = stable_post_id(topic_id, author, posted_time, content)
-        media_url, media_label = extract_media_link(body, reply_div)
+        attachments = extract_attachments(reply_div)
 
         if post_id not in seen and (content or author or posted_time):
             posts.append({
                 "topic_id": topic_id,
                 "post_id": post_id,
                 "parent_post_id": parent_post_id or "",
+                "post_level": post_level,
+                "replyable": bool(reply_link),
+                "is_own": is_own_post(actions),
                 "author": author or "Unknown",
-                "content_excerpt": truncate_text(content),
-                "media_url": media_url,
-                "media_label": media_label,
+                "content_excerpt": truncate_text(content, DETAIL_EXCERPT_LENGTH),
+                "media_url": attachments[0]["url"] if attachments else "",
+                "media_label": attachments[0]["label"] if attachments else "",
+                "attachments": attachments,
                 "posted_time": posted_time,
             })
             seen.add(post_id)
 
         for nested in body.find_all("div", class_=class_has_media, recursive=False):
-            parse_media(nested, post_id)
+            parse_media(nested, post_id, post_level + 1)
 
     for media in card.find_all("div", class_=class_has_media):
         if media.find_parent("div", class_=class_has_media):
@@ -588,53 +678,91 @@ def extract_topic_posts(soup, topic_id):
     return posts
 
 
-def scrape_topic_details(session, all_results):
+def ordered_topic_detail_weeks(all_results, priority_changes=None):
+    priority_keys = []
+    for change in priority_changes or []:
+        key = (change.get("course_code"), change.get("week"))
+        if key not in priority_keys:
+            priority_keys.append(key)
+
+    week_items = []
+    for course_code, weeks in all_results.items():
+        for week in weeks:
+            week_items.append((course_code, week))
+
+    ordered = []
+    seen = set()
+    for key in priority_keys:
+        for course_code, week in week_items:
+            item_key = (course_code, week.get("week"))
+            if item_key == key and item_key not in seen:
+                ordered.append((course_code, week, True))
+                seen.add(item_key)
+
+    for course_code, week in week_items:
+        item_key = (course_code, week.get("week"))
+        if item_key not in seen:
+            ordered.append((course_code, week, False))
+            seen.add(item_key)
+
+    return ordered
+
+
+def scrape_topic_details(session, all_results, priority_changes=None, fetch_all=True):
     if not SCRAPE_TOPIC_DETAILS or TOPIC_DETAIL_LIMIT <= 0:
+        return [], []
+    if not fetch_all and not priority_changes:
+        print("No changed weeks; skipping topic detail scraping")
         return [], []
 
     topics = []
     posts = []
     seen_topics = set()
     fetched_topics = 0
+    priority_count = len(priority_changes or [])
+    if priority_count:
+        print(f"Prioritizing {priority_count} changed week(s) for topic detail scraping")
 
-    for course_code, weeks in all_results.items():
-        for week in weeks:
-            if fetched_topics >= TOPIC_DETAIL_LIMIT:
-                break
-            if parse_count(week.get("topics")) <= 0 and parse_count(week.get("posts")) <= 0:
-                continue
+    for course_code, week, is_priority in ordered_topic_detail_weeks(all_results, priority_changes):
+        if fetched_topics >= TOPIC_DETAIL_LIMIT:
+            break
+        if not fetch_all and not is_priority:
+            break
+        if parse_count(week.get("topics")) <= 0 and parse_count(week.get("posts")) <= 0:
+            continue
 
-            try:
-                week_response = request_with_retries(
+        try:
+            context_prefix = "changed " if is_priority else ""
+            week_response = request_with_retries(
+                session,
+                "GET",
+                week["week_link"],
+                context=f"Fetch {context_prefix}topic list for {course_code} {week['week']}",
+                timeout=30,
+            )
+            week_topics = extract_week_topics(safe_soup(week_response.text), course_code, week["week"])
+            for topic in week_topics:
+                if fetched_topics >= TOPIC_DETAIL_LIMIT:
+                    break
+                if topic["topic_id"] in seen_topics:
+                    continue
+
+                topics.append(topic)
+                seen_topics.add(topic["topic_id"])
+
+                topic_response = request_with_retries(
                     session,
                     "GET",
-                    week["week_link"],
-                    context=f"Fetch topic list for {course_code} {week['week']}",
+                    topic["topic_url"],
+                    context=f"Fetch topic detail for {course_code} {topic['topic_title']}",
                     timeout=30,
                 )
-                week_topics = extract_week_topics(safe_soup(week_response.text), course_code, week["week"])
-                for topic in week_topics:
-                    if fetched_topics >= TOPIC_DETAIL_LIMIT:
-                        break
-                    if topic["topic_id"] in seen_topics:
-                        continue
-
-                    topics.append(topic)
-                    seen_topics.add(topic["topic_id"])
-
-                    topic_response = request_with_retries(
-                        session,
-                        "GET",
-                        topic["topic_url"],
-                        context=f"Fetch topic detail for {course_code} {topic['topic_title']}",
-                        timeout=30,
-                    )
-                    posts.extend(extract_topic_posts(safe_soup(topic_response.text), topic["topic_id"]))
-                    fetched_topics += 1
-                    time.sleep(0.5)
-            except ScraperError as error:
-                print(f"Skipping topic details for {course_code} {week['week']}: {error}")
-            time.sleep(0.4)
+                posts.extend(extract_topic_posts(safe_soup(topic_response.text), topic["topic_id"]))
+                fetched_topics += 1
+                time.sleep(0.5)
+        except ScraperError as error:
+            print(f"Skipping topic details for {course_code} {week['week']}: {error}")
+        time.sleep(0.4)
 
     print(f"Extracted {len(topics)} topic detail row(s), {len(posts)} post row(s)")
     return topics, posts
@@ -677,12 +805,17 @@ def save_to_db(conn, courses, all_results, topic_details=None, post_details=None
 
     for post in post_details or []:
         c.execute('''INSERT OR REPLACE INTO posts
-                    (topic_id, post_id, parent_post_id, author, content_excerpt,
-                     media_url, media_label, posted_time, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (topic_id, post_id, parent_post_id, post_level, replyable, is_own, author,
+                     content_excerpt, media_url, media_label, attachments_json, posted_time,
+                     last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                  (post['topic_id'], post['post_id'], post.get('parent_post_id', ''),
-                  post.get('author', ''), post.get('content_excerpt', ''),
+                  post.get('post_level', 0), 1 if post.get('replyable') else 0,
+                  1 if post.get('is_own') else 0,
+                  post.get('author', ''),
+                  post.get('content_excerpt', ''),
                   post.get('media_url', ''), post.get('media_label', ''),
+                  json.dumps(post.get('attachments') or []),
                   post.get('posted_time', ''), now))
     
     conn.commit()
@@ -695,7 +828,8 @@ def get_current_state(conn):
     """Get current forum state from database"""
     c = conn.cursor()
     
-    c.execute('''SELECT c.course_code, c.course_name, w.week_title, w.topics, w.posts, w.latest_user, w.latest_time
+    c.execute('''SELECT c.course_code, c.course_name, w.week_title, w.week_link,
+                        w.topics, w.posts, w.latest_user, w.latest_time
                  FROM weeks w
                  JOIN courses c ON w.course_code = c.course_code
                  ORDER BY c.course_code, w.week_title''')
@@ -706,10 +840,11 @@ def get_current_state(conn):
             'course_code': row[0],
             'course_name': row[1],
             'week': row[2],
-            'topics': row[3],
-            'posts': row[4],
-            'latest_user': row[5],
-            'latest_time': row[6]
+            'week_link': row[3],
+            'topics': row[4],
+            'posts': row[5],
+            'latest_user': row[6],
+            'latest_time': row[7]
         })
     
     return data
@@ -763,11 +898,12 @@ def get_current_post_state(conn, topic_ids=None):
 
     c.execute(f'''SELECT t.course_code, t.week_title, t.topic_id, t.topic_title, t.topic_url,
                          p.post_id, p.parent_post_id, p.author, p.content_excerpt,
-                         p.media_url, p.media_label, p.posted_time, p.id
+                         p.media_url, p.media_label, p.posted_time, p.post_level, p.replyable, p.id,
+                         p.is_own, p.attachments_json
                   FROM posts p
                   JOIN topics t ON p.topic_id = t.topic_id
                   {where_clause}
-                  ORDER BY t.course_code, t.week_title, t.topic_title, p.id''', params)
+                  ORDER BY t.course_code, t.week_title, t.topic_title, p.post_level, p.id''', params)
 
     data = []
     for row in c.fetchall():
@@ -784,8 +920,35 @@ def get_current_post_state(conn, topic_ids=None):
             'media_url': row[9],
             'media_label': row[10],
             'posted_time': row[11],
+            'post_level': row[12] or 0,
+            'replyable': bool(row[13]),
+            'is_own': bool(row[15]),
+            'attachments': parse_attachments_json(row[16]),
         })
     return data
+
+
+def parse_attachments_json(value):
+    try:
+        attachments = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return attachments if isinstance(attachments, list) else []
+
+
+def load_detail_history(conn):
+    """Previously stored topic/post ids, in the same shape as a snapshot.
+
+    The posts table keeps every post ever fetched, unlike the snapshot, which
+    only holds the topics fetched in the last run.
+    """
+    c = conn.cursor()
+    topics = [{"topic_id": row[0]} for row in c.execute("SELECT DISTINCT topic_id FROM topics")]
+    posts = [
+        {"topic_id": row[0], "post_id": row[1]}
+        for row in c.execute("SELECT topic_id, post_id FROM posts")
+    ]
+    return {"topics": topics, "posts": posts}
 
 
 def normalize_snapshot(snapshot):
@@ -868,7 +1031,8 @@ def detect_changes(current, last):
                         'total_posts': curr_posts,
                         'total_topics': curr_topics,
                         'latest_user': curr_item['latest_user'],
-                        'latest_time': curr_item['latest_time']
+                        'latest_time': curr_item['latest_time'],
+                        'week_link': curr_item.get('week_link', '')
                     })
             except (KeyError, TypeError, ValueError) as error:
                 print(f"Skipping invalid snapshot row for {key}: {error}")
@@ -883,12 +1047,97 @@ def group_by(items, key_func):
     return grouped
 
 
-def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
+def topic_root_post(topic_posts):
+    for post in topic_posts:
+        if not post.get("parent_post_id") or post.get("post_level") == 0:
+            return post
+    return topic_posts[0] if topic_posts else None
+
+
+def topic_reply_targets(topic_posts, root_post):
+    root_post_id = root_post.get("post_id") if root_post else ""
+    replyable_posts = [
+        post for post in topic_posts
+        if post.get("post_id")
+        and post.get("post_id") != root_post_id
+        and post.get("replyable")
+    ]
+    target_limit = max(0, TELEGRAM_REPLY_TARGET_LIMIT)
+    if not target_limit:
+        return []
+    return replyable_posts[-target_limit:]
+
+
+def parse_posted_time(value):
+    try:
+        return datetime.strptime(str(value or "").strip(), "%d/%m/%Y %I:%M %p")
+    except ValueError:
+        return None
+
+
+def sort_posts_chronologically(posts):
+    """UiTM renders posts in thread order, so nested replies are not in time order."""
+    indexed = list(enumerate(posts))
+    indexed.sort(key=lambda item: (parse_posted_time(item[1].get("posted_time")) or datetime.min, item[0]))
+    return [post for _, post in indexed]
+
+
+def same_person(name, other):
+    def normalize(value):
+        return re.sub(r"\s+", " ", str(value or "")).strip().upper()
+    return bool(normalize(name)) and normalize(name) == normalize(other)
+
+
+def annotate_topic_posts(topic, topic_posts):
+    own_post_ids = {post.get("post_id") for post in topic_posts if post.get("is_own")}
+    creator = topic.get("created_by")
+    return [
+        dict(
+            post,
+            to_me=bool(post.get("parent_post_id") in own_post_ids and not post.get("is_own")),
+            by_creator=same_person(post.get("author"), creator),
+        )
+        for post in sort_posts_chronologically(topic_posts)
+    ]
+
+
+def build_topic_detail(topic, topic_posts, new_posts, *, is_new_topic, exact_post_diff, display_posts):
+    root_post = topic_root_post(topic_posts)
+    media_post = next((post for post in topic_posts if post.get("media_url")), None)
+    important = (
+        is_new_topic
+        or not exact_post_diff
+        or any(post.get("to_me") or post.get("by_creator") for post in new_posts)
+    )
+    return {
+        "topic_id": topic["topic_id"],
+        "topic_title": topic.get("topic_title", ""),
+        "topic_url": topic.get("topic_url", ""),
+        "description": topic.get("description", ""),
+        "created_by": topic.get("created_by", ""),
+        "created_at": topic.get("created_at", ""),
+        "replies": topic.get("replies", 0),
+        "last_activity": topic.get("last_activity", ""),
+        "new_topic": is_new_topic,
+        "new_posts": len(new_posts),
+        "replied_to_me": sum(1 for post in new_posts if post.get("to_me")),
+        "important": important,
+        "posts": display_posts[-3:],
+        "root_post": root_post,
+        "detail_posts": display_posts[-10:],
+        "reply_targets": topic_reply_targets(topic_posts, root_post),
+        "media_url": media_post.get("media_url", "") if media_post else "",
+        "media_label": media_post.get("media_label", "") if media_post else "",
+        "exact_post_diff": exact_post_diff,
+    }
+
+
+def attach_topic_details(changes, current_topics, current_posts, detail_history):
     if not changes or not current_topics:
         return changes
 
-    last_topics = last_snapshot.get("topics", []) if last_snapshot else []
-    last_posts = last_snapshot.get("posts", []) if last_snapshot else []
+    last_topics = detail_history.get("topics", []) if detail_history else []
+    last_posts = detail_history.get("posts", []) if detail_history else []
     has_detail_history = bool(last_topics or last_posts)
     last_topic_ids = {item.get("topic_id") for item in last_topics}
     last_post_ids_by_topic = group_by(last_posts, lambda item: item.get("topic_id"))
@@ -904,63 +1153,75 @@ def attach_topic_details(changes, current_topics, current_posts, last_snapshot):
     for change in changes:
         week_topics = topics_by_week.get((change["course_code"], change["week"]), [])
         details = []
+        own_new_count = 0
 
         for topic in week_topics:
-            topic_posts = posts_by_topic.get(topic["topic_id"], [])
+            topic_posts = annotate_topic_posts(topic, posts_by_topic.get(topic["topic_id"], []))
             previous_post_ids = last_post_ids_by_topic.get(topic["topic_id"], set())
-            new_posts = [
-                post for post in topic_posts
-                if has_detail_history and post.get("post_id") not in previous_post_ids
-            ]
-            is_new_topic = has_detail_history and topic["topic_id"] not in last_topic_ids
+            has_post_history = bool(previous_post_ids)
+            is_new_topic = (
+                has_detail_history
+                and change.get("new_topics", 0) > 0
+                and topic["topic_id"] not in last_topic_ids
+            )
+            if has_detail_history and has_post_history:
+                new_posts = [
+                    post for post in topic_posts
+                    if post.get("post_id") not in previous_post_ids
+                ]
+            elif is_new_topic:
+                new_posts = topic_posts
+            else:
+                fallback_count = max(1, min(change.get("new_posts", 0), len(topic_posts)))
+                new_posts = topic_posts[-fallback_count:] if topic_posts and fallback_count else []
+            exact_post_diff = has_detail_history and has_post_history
+
+            own_new_count += sum(1 for post in new_posts if post.get("is_own"))
+            new_posts = [post for post in new_posts if not post.get("is_own")]
+            if is_new_topic and not new_posts:
+                is_new_topic = False
 
             if has_detail_history and not is_new_topic and not new_posts:
                 continue
 
-            latest_posts = new_posts or topic_posts[-2:]
-            media_post = next((post for post in topic_posts if post.get("media_url")), None)
-            details.append({
-                "topic_id": topic["topic_id"],
-                "topic_title": topic.get("topic_title", ""),
-                "topic_url": topic.get("topic_url", ""),
-                "description": topic.get("description", ""),
-                "created_by": topic.get("created_by", ""),
-                "created_at": topic.get("created_at", ""),
-                "replies": topic.get("replies", 0),
-                "last_activity": topic.get("last_activity", ""),
-                "new_topic": is_new_topic,
-                "new_posts": len(new_posts),
-                "posts": latest_posts[-3:],
-                "media_url": media_post.get("media_url", "") if media_post else "",
-                "media_label": media_post.get("media_label", "") if media_post else "",
-                "exact_post_diff": has_detail_history,
-            })
+            others = [post for post in topic_posts if not post.get("is_own")]
+            details.append(build_topic_detail(
+                topic, topic_posts, new_posts,
+                is_new_topic=is_new_topic,
+                exact_post_diff=exact_post_diff,
+                display_posts=new_posts or others[-2:],
+            ))
+
+        if not details and own_new_count:
+            # Every new post in this week was written by the logged-in user.
+            change["own_only"] = True
+            continue
 
         if not details:
             for topic in week_topics[:topic_limit]:
-                topic_posts = posts_by_topic.get(topic["topic_id"], [])
-                media_post = next((post for post in topic_posts if post.get("media_url")), None)
-                details.append({
-                    "topic_id": topic["topic_id"],
-                    "topic_title": topic.get("topic_title", ""),
-                    "topic_url": topic.get("topic_url", ""),
-                    "description": topic.get("description", ""),
-                    "created_by": topic.get("created_by", ""),
-                    "created_at": topic.get("created_at", ""),
-                    "replies": topic.get("replies", 0),
-                    "last_activity": topic.get("last_activity", ""),
-                    "new_topic": False,
-                    "new_posts": 0,
-                    "posts": topic_posts[-2:],
-                    "media_url": media_post.get("media_url", "") if media_post else "",
-                    "media_label": media_post.get("media_label", "") if media_post else "",
-                    "exact_post_diff": has_detail_history,
-                })
+                topic_posts = annotate_topic_posts(topic, posts_by_topic.get(topic["topic_id"], []))
+                others = [post for post in topic_posts if not post.get("is_own")]
+                detail = build_topic_detail(
+                    topic, topic_posts, [],
+                    is_new_topic=False,
+                    exact_post_diff=has_detail_history,
+                    display_posts=others[-2:],
+                )
+                detail["important"] = True
+                details.append(detail)
 
+        if own_new_count:
+            change["new_posts"] = max(0, change.get("new_posts", 0) - own_new_count)
         change["topic_details"] = details[:topic_limit]
         change["topic_details_truncated"] = len(details) > topic_limit
+        change["silent"] = bool(
+            TELEGRAM_SILENT_CLASSMATE_REPLIES
+            and details
+            and not any(detail.get("important") for detail in details)
+        )
 
-    return changes
+    changes = [change for change in changes if not change.get("own_only")]
+    return changes or None
 
 # ============================================================================
 # TELEGRAM NOTIFICATIONS
@@ -971,11 +1232,13 @@ def html_text(value, *, quote=False):
 
 
 def topic_link(topic):
-    title = html_text(topic.get("topic_title") or "Open topic")
-    url = html_text(topic.get("topic_url"), quote=True)
-    if url:
-        return f'<a href="{url}">{title}</a>'
-    return title
+    return html_text(topic.get("topic_title") or "Open topic")
+
+
+def plain_telegram_text(text):
+    text = re.sub(r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre)[^>]*>", "", text)
+    text = re.sub(r'<a\s+href="[^"]*"\s*>(.*?)</a>', r"\1", text)
+    return html.unescape(text)
 
 
 def course_display_name(change):
@@ -992,15 +1255,7 @@ def format_count(count, noun, plural=None):
 
 def grouped_posts(posts):
     if not TELEGRAM_DEDUP_REPLIES:
-        return [
-            {
-                "author": post.get("author") or "Unknown",
-                "content_excerpt": post.get("content_excerpt") or "",
-                "posted_time": post.get("posted_time") or "",
-                "count": 1,
-            }
-            for post in posts
-        ]
+        return [display_post(post) for post in posts]
 
     grouped = []
     index_by_key = {}
@@ -1014,40 +1269,98 @@ def grouped_posts(posts):
             item["count"] += 1
             if post.get("posted_time"):
                 item["posted_time"] = post.get("posted_time")
+            item["to_me"] = item["to_me"] or bool(post.get("to_me"))
             continue
         index_by_key[key] = len(grouped)
-        grouped.append({
-            "author": post.get("author") or "Unknown",
-            "content_excerpt": post.get("content_excerpt") or "",
-            "posted_time": post.get("posted_time") or "",
-            "count": 1,
-        })
+        grouped.append(display_post(post))
     return grouped
+
+
+def display_post(post):
+    return {
+        "author": post.get("author") or "Unknown",
+        "content_excerpt": post.get("content_excerpt") or "",
+        "posted_time": post.get("posted_time") or "",
+        "to_me": bool(post.get("to_me")),
+        "by_creator": bool(post.get("by_creator")),
+        "attachments": post.get("attachments") or [],
+        "count": 1,
+    }
 
 
 def topic_button_suffix(index, total):
     return f" {index}" if total > 1 else ""
 
 
-def build_inline_keyboard(change):
+def callback_buttons_enabled(conn=None):
+    return (
+        TELEGRAM_INTERACTIVE_BOT
+        and conn is not None
+        and TELEGRAM_BUTTON_MODE in {"callback", "hybrid"}
+    )
+
+
+def create_telegram_action(conn, action_type, change, topic):
+    now = datetime.now()
+    expires_at = now + timedelta(hours=max(1, TELEGRAM_ACTION_TTL_HOURS))
+    action_id = secrets.token_urlsafe(8)
+    payload = {
+        "change": {
+            "course_code": change.get("course_code"),
+            "course_name": change.get("course_name"),
+            "week": change.get("week"),
+            "latest_user": change.get("latest_user"),
+            "latest_time": change.get("latest_time"),
+        },
+        "topic": topic,
+    }
+    conn.execute('''INSERT INTO telegram_actions
+                   (action_id, action_type, chat_id, course_code, week_title,
+                    topic_id, post_id, topic_url, media_url, created_at,
+                    expires_at, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (action_id, action_type, TELEGRAM_CHAT_ID,
+                  change.get("course_code", ""), change.get("week", ""),
+                  topic.get("topic_id", ""), "", topic.get("topic_url", ""),
+                  topic.get("media_url", ""), now.isoformat(),
+                  expires_at.isoformat(), json.dumps(payload)))
+    return action_id
+
+
+def build_inline_keyboard(change, conn=None):
     if not TELEGRAM_INLINE_BUTTONS:
         return None
 
     topic_details = [topic for topic in change.get("topic_details", []) if topic.get("topic_url")]
     if not topic_details:
+        if change.get("week_link"):
+            return {"inline_keyboard": [[{"text": "Open week", "url": change["week_link"]}]]}
         return None
 
     total = len(topic_details)
     rows = []
+    use_callbacks = callback_buttons_enabled(conn)
     for index, topic in enumerate(topic_details, start=1):
         suffix = topic_button_suffix(index, total)
-        row = [
-            {"text": f"Reply{suffix}", "url": topic["topic_url"]},
-            {"text": f"Details{suffix}", "url": topic["topic_url"]},
-        ]
+        if use_callbacks:
+            details_id = create_telegram_action(conn, "details", change, topic)
+            reply_id = create_telegram_action(conn, "reply", change, topic)
+            row = [
+                {"text": f"Details{suffix}", "callback_data": f"d:{details_id}"},
+                {"text": f"Reply{suffix}", "callback_data": f"r:{reply_id}"},
+            ]
+        else:
+            row = [
+                {"text": f"Details{suffix}", "url": topic["topic_url"]},
+                {"text": f"Reply{suffix}", "url": topic["topic_url"]},
+            ]
         if TELEGRAM_MEDIA_BUTTONS and topic.get("media_url"):
             row.append({"text": f"Media{suffix}", "url": topic["media_url"]})
+        row.append({"text": f"Open{suffix}", "url": topic["topic_url"]})
         rows.append(row)
+
+    if use_callbacks:
+        conn.commit()
 
     return {"inline_keyboard": rows}
 
@@ -1060,6 +1373,9 @@ def build_change_block(change, *, number_topics=False):
     ]
 
     summary = []
+    replied_to_me = sum(topic.get("replied_to_me", 0) for topic in change.get("topic_details") or [])
+    if replied_to_me:
+        summary.append(f"↩️ {format_count(replied_to_me, 'reply', 'replies')} to you")
     if change['new_topics'] > 0:
         summary.append(f"🆕 {format_count(change['new_topics'], 'new topic')}")
     if change['new_posts'] > 0:
@@ -1085,10 +1401,14 @@ def build_change_block(change, *, number_topics=False):
             for post in grouped_posts(topic.get("posts", [])):
                 author = html_text(short_display_name(post.get("author") or "Unknown"))
                 posted_time = html_text(post.get("posted_time") or "-")
-                excerpt = html_text(post.get("content_excerpt") or "")
+                excerpt = html_text(truncate_text(post.get("content_excerpt") or "", REPLY_EXCERPT_LENGTH))
                 if excerpt:
                     suffix = f" ×{post['count']}" if post.get("count", 1) > 1 else ""
-                    lines.append(f"↳ {author}: {excerpt}{suffix}")
+                    marker = "📌 " if post.get("by_creator") else ""
+                    to_me = " ↩️ you" if post.get("to_me") else ""
+                    lines.append(f"↳ {marker}{author}{to_me}: {excerpt}{suffix}")
+                    for attachment in post.get("attachments", [])[:3]:
+                        lines.append(f"  📎 {html_text(attachment.get('label') or 'Attachment')}")
                     lines.append(f"  {posted_time}")
                     showed_posts = True
 
@@ -1145,7 +1465,7 @@ def chunk_telegram_text_blocks(blocks):
     return messages
 
 
-def build_telegram_payloads(changes):
+def build_telegram_payloads(changes, conn=None):
     if TELEGRAM_INLINE_BUTTONS:
         payloads = []
         for change in changes:
@@ -1155,9 +1475,10 @@ def build_telegram_payloads(changes):
                 block,
                 f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
             ])
-            keyboard = build_inline_keyboard(change)
+            keyboard = build_inline_keyboard(change, conn)
+            silent = bool(change.get("silent"))
             if len(text) <= 3900:
-                payload = {"text": text}
+                payload = {"text": text, "disable_notification": silent}
                 if keyboard:
                     payload["reply_markup"] = keyboard
                 payloads.append(payload)
@@ -1165,13 +1486,14 @@ def build_telegram_payloads(changes):
 
             chunks = chunk_telegram_text_blocks([block])
             for index, chunk in enumerate(chunks):
-                payload = {"text": chunk}
+                payload = {"text": chunk, "disable_notification": silent}
                 if index == 0 and keyboard:
                     payload["reply_markup"] = keyboard
                 payloads.append(payload)
         return payloads
 
-    return [{"text": message} for message in chunk_telegram_text_blocks(
+    silent = all(change.get("silent") for change in changes)
+    return [{"text": message, "disable_notification": silent} for message in chunk_telegram_text_blocks(
         [build_change_block(change) for change in changes]
     )]
 
@@ -1180,29 +1502,72 @@ def build_telegram_messages(changes):
     return [payload["text"] for payload in build_telegram_payloads(changes)]
 
 
-def send_telegram_notification(changes):
+def send_telegram_notification(changes, conn=None):
     """Send Telegram notification"""
-    if not TELEGRAM_ENABLED or not changes:
+    if not changes or not (TELEGRAM_ENABLED or DRY_RUN):
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payloads = build_telegram_payloads(changes)
+    payloads = build_telegram_payloads(changes, conn)
     sent = 0
+
+    if DRY_RUN:
+        for index, payload in enumerate(payloads, start=1):
+            mode = "silent" if payload.get("disable_notification") else "with sound"
+            print(f"--- DRY_RUN Telegram message {index}/{len(payloads)} ({mode}) ---")
+            print(plain_telegram_text(payload["text"]))
+            for row in (payload.get("reply_markup") or {}).get("inline_keyboard", []):
+                print("[" + "] [".join(button["text"] for button in row) + "]")
+        print(f"DRY_RUN: {len(payloads)} Telegram message(s) not sent")
+        return True
+
+    def response_description(response):
+        try:
+            data = response.json()
+        except ValueError:
+            return response.text[:200]
+        return str(data.get("description") or data)[:300]
+
+    def post_payload(payload, *, include_markup=True, parse_mode="HTML"):
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": payload["text"] if parse_mode else plain_telegram_text(payload["text"]),
+            "disable_web_page_preview": True,
+            "disable_notification": bool(payload.get("disable_notification")),
+        }
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        if include_markup and payload.get("reply_markup"):
+            data["reply_markup"] = json.dumps(payload["reply_markup"])
+        return requests.post(url, data=data, timeout=10)
 
     try:
         for payload in payloads:
-            data = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": payload["text"],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if payload.get("reply_markup"):
-                data["reply_markup"] = json.dumps(payload["reply_markup"])
-            response = requests.post(url, data=data, timeout=10)
+            response = post_payload(payload)
             if response.status_code != 200:
-                print(f"Failed to send Telegram notification: HTTP {response.status_code}")
-                return False
+                print(
+                    "Telegram send failed with full payload: "
+                    f"HTTP {response.status_code} - {response_description(response)}"
+                )
+                if payload.get("reply_markup"):
+                    response = post_payload(payload, include_markup=False)
+                    if response.status_code == 200:
+                        print("Telegram notification sent without inline buttons after fallback")
+                    else:
+                        print(
+                            "Telegram fallback without buttons failed: "
+                            f"HTTP {response.status_code} - {response_description(response)}"
+                        )
+                if response.status_code != 200:
+                    response = post_payload(payload, include_markup=False, parse_mode=None)
+                    if response.status_code == 200:
+                        print("Telegram notification sent as plain text after fallback")
+                    else:
+                        print(
+                            "Failed to send Telegram notification after fallbacks: "
+                            f"HTTP {response.status_code} - {response_description(response)}"
+                        )
+                        return False
             sent += 1
         print(f"Telegram notification sent ({sent} message part(s))")
         return True
@@ -1235,7 +1600,7 @@ def run_scrape():
             "data[User][role]": ROLE,
             "_method": "POST"
         }
-        request_with_retries(
+        login_response = request_with_retries(
             s,
             "POST",
             LOGIN_URL,
@@ -1245,6 +1610,12 @@ def run_scrape():
             allow_redirects=True,
             timeout=30,
         )
+        # A successful login redirects away from /login (to /courses/list_course).
+        if urlparse(login_response.url).path.rstrip("/").endswith("/login"):
+            raise LoginError(
+                "UiTM login was rejected (still on the login page). "
+                "Check UFUTURE_USERNAME/UFUTURE_PASSWORD; not retrying to avoid account lockout."
+            )
         print("Logged in successfully")
     except ScraperError:
         conn.close()
@@ -1333,24 +1704,32 @@ def run_scrape():
         conn.close()
         raise ScraperError("No forum week rows extracted. Refusing to update database or snapshot.")
 
-    # Extract topic/post details after the week overview has succeeded.
-    topic_details, post_details = scrape_topic_details(s, all_results)
+    # Save week overview first so changes can be detected before spending the topic detail limit.
+    save_to_db(conn, courses, all_results)
 
-    # Save to database
-    save_to_db(conn, courses, all_results, topic_details, post_details)
-    print(f"Saved to database: {DB_FILE}")
-    
-    # Get current state
+    # Get current week state
     current = get_current_state(conn)
-    fetched_topic_ids = [topic["topic_id"] for topic in topic_details]
-    current_topics = get_current_topic_state(conn, fetched_topic_ids)
-    current_posts = get_current_post_state(conn, fetched_topic_ids)
-    
-    # Check for changes
+
+    # Check for week-level changes before topic detail scraping.
     last_snapshot = load_last_snapshot()
     last_weeks = last_snapshot.get("weeks", []) if last_snapshot else None
     changes = detect_changes(current, last_weeks)
-    changes = attach_topic_details(changes, current_topics, current_posts, last_snapshot)
+
+    # Topic/post ids seen in earlier runs; read before this run's details are saved.
+    detail_history = load_detail_history(conn)
+    fetch_all_topics = TOPIC_DETAIL_MODE == "all" or not detail_history["topics"]
+
+    # Extract topic/post details after the week overview has succeeded.
+    topic_details, post_details = scrape_topic_details(s, all_results, changes, fetch_all_topics)
+
+    # Save topic details to database.
+    save_to_db(conn, courses, all_results, topic_details, post_details)
+    print(f"Saved to database: {DB_FILE}")
+
+    fetched_topic_ids = [topic["topic_id"] for topic in topic_details]
+    current_topics = get_current_topic_state(conn, fetched_topic_ids)
+    current_posts = get_current_post_state(conn, fetched_topic_ids)
+    changes = attach_topic_details(changes, current_topics, current_posts, detail_history)
     
     # Display results
     print(f"Scrape completed: {len(all_results)} courses, {total_weeks} weeks\n")
@@ -1361,7 +1740,7 @@ def run_scrape():
         for change in changes:
             print(f"{change['course_code']}: {change['new_posts']} new post(s), {change['new_topics']} new topic(s)")
         print()
-        send_telegram_notification(changes)
+        send_telegram_notification(changes, conn)
     else:
         if last_snapshot:
             print("No changes detected\n")
