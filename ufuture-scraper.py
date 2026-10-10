@@ -248,6 +248,7 @@ def init_db():
     ensure_column(c, "telegram_pending_replies", "submitted_at", "TEXT")
     ensure_column(c, "telegram_pending_replies", "result_message", "TEXT")
     ensure_column(c, "telegram_pending_replies", "dedupe_key", "TEXT")
+    ensure_column(c, "telegram_pending_replies", "attachments_json", "TEXT")
 
     c.execute('''CREATE TABLE IF NOT EXISTS telegram_bot_state (
         key TEXT PRIMARY KEY,
