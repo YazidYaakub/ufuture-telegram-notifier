@@ -242,6 +242,7 @@ volumes:
 | `TELEGRAM_SEND_ATTACHMENTS` | Download attachments from new posts with the logged-in UiTM session and send them into Telegram as a reply to their notification. Files are held in memory only and never written to disk | `true` |
 | `ATTACHMENT_MAX_MB` | Largest attachment sent as a file; bigger ones get an "Open in UiTM" link instead (Telegram's bot upload limit is 50 MB) | `20` |
 | `ATTACHMENT_MAX_PER_RUN` | Maximum attachments sent per scraper run; the rest are sent on later runs | `5` |
+| `TELEGRAM_LAYOUT` | `digest` sends one message with sound per important topic (new topic, lecturer/topic-creator post, reply to you) plus one silent summary of classmates' replies per run; `classic` keeps one message per changed week | `digest` |
 | `DRY_RUN` | Print Telegram messages and alerts instead of sending them; use with temporary `DB_PATH`/`SNAPSHOT_PATH` | `false` |
 
 ## Telegram Setup
@@ -386,7 +387,13 @@ File contents are never stored.
 ### State Comparison
 The snapshot file uses schema version 2 and stores `weeks`, `topics`, and `posts`. Older week-only snapshot lists are still accepted and upgraded on the next successful run. On the first upgraded run, topic details enrich the notification; exact per-post diffs become available after one version-2 snapshot exists.
 
+### Notification Layout (`TELEGRAM_LAYOUT=digest`)
+- **Important topics** (new topics, posts by the topic creator, replies to your posts) each get a short message with sound: course, week (`W2`), topic, who posted and when (`today 2:10 PM`), the post text and 📎 attachment names. Attachments are sent as replies to that message.
+- **Classmates' replies** are grouped into one silent "Classmate replies" summary per run, with counts and first names.
+- Each topic has a single `Topic ▸` button that turns the message into a topic card (`📄 Details`, `✍️ Reply`, `🌐 Open in UiTM`, `« Back`). Details and Back edit the same message instead of adding new ones.
+
 ### Interactive Telegram Bot
+- `Topic ▸` opens the topic card in place; `« Back` restores the original notification.
 - `Details` shows stored topic/reply context inside Telegram.
 - `Reply` lets you choose `Original post` or a recent replyable reply, then write a response.
 - `Preview` shows the target and message before any post attempt.
