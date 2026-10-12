@@ -1,0 +1,25 @@
+# uFuture Telegram Notifier
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f
+# Update:  docker compose pull && docker compose up -d
+# Stop:    docker compose down
+#
+# Your settings go in the ".env" file next to this one (copy ".env.example").
+
+services:
+  ufuture-telegram-notifier:
+    image: ghcr.io/yazidyaakub/ufuture-telegram-notifier:latest
+    container_name: ufuture-telegram-notifier
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Where the app keeps its data inside the container (no need to change).
+      DB_PATH: /app/data/ufuture_forums.db
+      SNAPSHOT_PATH: /app/data/telegram_last_snapshot.json
+      LOG_DIR: /app/logs
+    volumes:
+      # The app's database is saved in a "data" folder next to this file,
+      # so it survives restarts and updates.
+      - ./data:/app/data
+      - ./logs:/app/logs
