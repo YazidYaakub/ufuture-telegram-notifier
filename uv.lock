@@ -289,7 +289,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ufuture-forum-scraper"
+name = "ufuture-telegram-notifier"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

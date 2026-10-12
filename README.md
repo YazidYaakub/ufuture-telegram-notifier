@@ -1,17 +1,22 @@
-# UiTM Forum Scraper + Telegram Notifier
+# uFuture Telegram Notifier
+
+[![Python](https://img.shields.io/badge/Python-3.10-blue)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED)](docs/setup-guide.md)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4)](https://core.telegram.org/bots)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE)
 
 Watches your UiTM uFuture course forums and brings them into Telegram: notifications for new posts, lecturer files in the chat, browsing, and replying back to the forum. Runs on your own computer or server with Docker.
 
 ## Features
 
-- 🔍 **Forum monitoring**: checks every enrolled course forum every 10 minutes and detects new topics and posts exactly (compared against every stored post).
-- 🔔 **Smart notifications**: lecturer posts, new topics and replies to you arrive with sound; classmates' replies are grouped into one silent summary; your own posts never notify.
-- 📎 **Files in Telegram**: attachments from new posts are sent into the chat (images inline), held in memory only and never written to disk.
-- 🧵 **Topic cards**: one `▸` button per topic opens details, files and reply options in place.
-- ✍️ **Reply from Telegram**: swipe-reply to a notification (optionally with files); the reply is posted with UiTM's own reply form and confirmed on the forum.
-- 🤖 **Bot commands**: `/latest`, `/courses`, `/files`, `/status`, `/drafts`, `/mute`.
-- 🛡️ **Safe by default**: posting is off until enabled; login rejections are not retried (no account lockout); failure and recovery alerts.
-- 🐳 **Easy to run**: one Docker container (ready-made image for PCs and Raspberry Pi), set up with a single `.env` file; also runs on TrueNAS.
+- **Forum monitoring**: checks every enrolled course forum every 10 minutes and detects new topics and posts exactly (compared against every stored post).
+- **Smart notifications**: lecturer posts, new topics and replies to you arrive with sound; classmates' replies are grouped into one silent summary; your own posts never notify.
+- **Files in Telegram**: attachments from new posts are sent into the chat (images inline), held in memory only and never written to disk.
+- **Topic cards**: one `▸` button per topic opens details, files and reply options in place.
+- **Reply from Telegram**: swipe-reply to a notification (optionally with files); the reply is posted with UiTM's own reply form and confirmed on the forum.
+- **Bot commands**: `/latest`, `/courses`, `/files`, `/status`, `/drafts`, `/mute`.
+- **Safe by default**: posting is off until enabled; login rejections are not retried (no account lockout); failure and recovery alerts.
+- **Easy to run**: one Docker container (ready-made image for PCs and Raspberry Pi), set up with a single `.env` file; also runs on TrueNAS.
 
 ## How it fits together
 
@@ -50,6 +55,8 @@ Each person runs their own copy with their own UiTM login and their own Telegram
 - **Any Docker host (Linux server, Raspberry Pi, Unraid, Synology, Portainer):** use the same `docker-compose.yml` and `.env`.
 - **From source (development):**
   ```bash
+  git clone https://github.com/YazidYaakub/ufuture-telegram-notifier.git
+  cd ufuture-telegram-notifier
   uv sync
   set -a; source .env; set +a      # load your settings
   DB_PATH=./data/ufuture_forums.db SNAPSHOT_PATH=./data/telegram_last_snapshot.json LOG_DIR=./logs \
@@ -126,10 +133,10 @@ The bot only responds in `TELEGRAM_CHAT_ID`, and only to `TELEGRAM_ALLOWED_USER_
 ## Using it in Telegram
 
 ### Notifications (`TELEGRAM_LAYOUT=digest`)
-- **Important topics** (new topics, posts by the topic creator, replies to your posts) each get a short message **with sound**: course, week (`W2`), topic, who posted and when, the post text and 📎 attachment names. Their files arrive as replies to that message.
+- **Important topics** (new topics, posts by the topic creator, replies to your posts) each get a short message **with sound**: course, week (`W2`), topic, who posted and when, the post text and attachment names. Their files arrive as replies to that message.
 - **Classmates' replies** are grouped into one **silent** "Classmate replies" summary per run.
 - Your own posts never notify.
-- Each topic has one `Topic ▸` button. It turns the message into a topic card (`📄 Details`, `✍️ Reply`, `📎 Files`, `🌐 Open in UiTM`, `« Back`); Details and Back edit the same message.
+- Each topic has one `Topic ▸` button. It turns the message into a topic card (`Details`, `Reply`, `Files`, `Open in UiTM`, `« Back`); Details and Back edit the same message.
 
 ### Commands
 
@@ -146,10 +153,10 @@ The bot only responds in `TELEGRAM_CHAT_ID`, and only to `TELEGRAM_ALLOWED_USER_
 
 ### Replying to the forum
 - **Swipe-reply** to a notification, topic card or list message and type (or send a file). The bot drafts a reply to the post shown in that message; on the classmate summary it first asks which topic. Swipe-reply works on notifications sent by v1.6.0 or later; for older ones, tap `▸` first.
-- **Or** tap `▸` → `✍️ Reply`, pick the post you're replying to, and type.
+- **Or** tap `▸` → `Reply`, pick the post you're replying to, and type.
 - Attach up to 5 files (20 MB each). A file's caption becomes the reply text.
-- The draft is one message: `📤 Send to UiTM`, `✏️ Edit text`, `🎯 Change target`, `🗑 Remove files`, `💾 Save`, `✖ Cancel`.
-- **Send to UiTM** (with `UFUTURE_REPLY_ENABLED=true`) posts through UiTM's reply form, re-reads the topic, and only reports `✅ Posted` once the reply is visible. The topic is refreshed in the bot right away, and Details marks your posts as `🙋 You`.
+- The draft is one message: `Send to UiTM`, `Edit text`, `Change target`, `Remove files`, `Save`, `Cancel`.
+- **Send to UiTM** (with `UFUTURE_REPLY_ENABLED=true`) posts through UiTM's reply form, re-reads the topic, and only reports `Posted` once the reply is visible. The topic is refreshed in the bot right away, and Details marks your posts as `You`.
 - **Safety:** preview and confirm every post, allowed users only, identical replies blocked, one post per `REPLY_MIN_INTERVAL_SECONDS`, no automatic retries. If UiTM rejects a reply the draft stays ready; if it can't be confirmed you're asked to check the topic first.
 
 ## How it works
@@ -194,7 +201,6 @@ ufuture-telegram-notifier/
 ├── docs/setup-guide.md          # Step-by-step guide for non-technical users
 ├── docs/deploy/truenas.md       # TrueNAS SCALE setup
 ├── .github/workflows/publish.yml # Builds the image and setup zip on each release
-├── AGENTS.md                    # Working agreements for AI coding agents
 └── README.md
 ```
 
