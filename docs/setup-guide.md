@@ -45,7 +45,7 @@ Docker is a free program that runs the app for you.
 ## Step 4: Download the app files and fill in your settings
 
 1. Make a new folder, for example **`uFuture`** in your **Documents**.
-2. Download the setup files from the latest release (you need access to the repository):
+2. Download the setup files from the latest release:
    **Releases → latest version → Assets → `ufuture-setup.zip`**.
    Unzip it into your `uFuture` folder. You should now have:
    - `docker-compose.yml`
