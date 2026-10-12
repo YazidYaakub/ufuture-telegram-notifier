@@ -2,7 +2,7 @@
 
 ## Project Scope
 
-This repository is a personal UiTM forum scraper and Telegram notifier. Treat it as a small operational Python service with sensitive credentials, live external dependencies, and stateful local data.
+This repository is a self-hosted UiTM uFuture forum scraper and Telegram notifier, shared privately with a few classmates. Treat it as a small operational Python service with sensitive credentials, live external dependencies, and stateful local data.
 
 ## Working Agreements
 
@@ -10,7 +10,7 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - Do not make code changes, repo changes, generated file changes, dependency changes, or documentation changes without explicit user approval in the current turn. Reading files and running read-only inspection commands is allowed.
 - Do not hardcode, print, commit, or preserve secrets. This includes UiTM credentials, Telegram bot tokens, chat IDs, Crawl4AI tokens, cookies, session headers, and `.env` values.
 - Do not run the live scraper, contact UiTM, send Telegram messages, or call Crawl4AI unless the user explicitly asks for that action in the current turn.
-- Do not store secrets, credentials, cookies, personal portal data, live scrape output, database rows, or Telegram payloads in Codex memories.
+- Do not store secrets, credentials, cookies, personal portal data, live scrape output, database rows, or Telegram payloads in AI assistant memories.
 - Keep code changes narrow. Prefer fixing the existing single-file scraper and scheduler structure before introducing new modules.
 - Use `uv` for local Python dependency workflows when dependency commands are needed.
 - Use `rtk` for large shell output when available, especially `rtk git status`, `rtk git diff`, `rtk grep`, `rtk read`, and `rtk test`.
@@ -55,7 +55,7 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 - After any approved implementation, run at least one smoke test that exercises the affected behavior without contacting UiTM or Telegram unless the user explicitly approved a live test.
 - For scraper-only Python changes, run at least `python -m py_compile ufuture-scraper.py scheduler.py`.
 - For dependency or Docker changes, also validate the relevant Docker or `uv` command when feasible.
-- For Codex policy changes under `.codex/`, validate JSON/TOML/Python syntax and run `codex execpolicy check` when Codex is available.
+- For `docker-compose.yml`, `.env.example` or workflow changes, validate with `docker compose config` and a YAML/workflow linter.
 - Report any validation that could not be run, including the reason.
 
 ## Smoke Test Artifacts
@@ -74,6 +74,12 @@ This repository is a personal UiTM forum scraper and Telegram notifier. Treat it
 ## Known Repo Notes
 
 - Main scraper: `ufuture-scraper.py`.
-- Scheduler: `scheduler.py`, runs the scraper every 10 minutes in Docker.
+- Scheduler: `scheduler.py`, runs the scraper every 10 minutes in Docker and sends failure/recovery alerts.
+- Interactive bot: `telegram_interactive_bot.py` (buttons, commands, reply drafts, posting replies to UiTM). It imports `ufuture-scraper.py` for login, parsing and formatting, so changes there can affect the bot.
+- Supervisor: `supervisor.py` starts and restarts the scheduler and the bot in one container.
 - Local state: `data/ufuture_forums.db` and `data/telegram_last_snapshot.json`.
-- Docker file name is `Dockerfile` to match TrueNAS/Linux case-sensitive builds.
+- Docker file name is `Dockerfile` to match TrueNAS/Linux case-sensitive builds. The image installs pinned dependencies from `uv.lock` (`uv sync --frozen`).
+- Release flow: merge to `main`, then publish a GitHub release `vX.Y.Z`. The `Publish image and setup files` workflow builds `ghcr.io/yazidyaakub/ufuture-telegram-notifier:vX.Y.Z` (+ `latest`, amd64/arm64) and attaches `ufuture-setup.zip`. Users update with `docker compose pull && docker compose up -d`; TrueNAS changes the image tag.
+- Shared with classmates: keep docs and messages understandable for non-technical users, and never commit personal data (student IDs, hostnames, tokens). `.env.example` and `docs/setup-guide.md` must stay in sync with the settings the code reads.
+- Posting to UiTM (`UFUTURE_REPLY_ENABLED`) creates real, public forum posts. Never test it live without explicit approval in the current turn.
+- For interactive-bot changes, also run `python -m py_compile telegram_interactive_bot.py supervisor.py`.
